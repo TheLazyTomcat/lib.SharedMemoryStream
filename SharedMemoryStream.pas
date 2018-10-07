@@ -1,5 +1,9 @@
 unit SharedMemoryStream;
 
+{$IFDEF FPC}
+  {$MODE ObjFPC}{$H+}
+{$ENDIF}
+
 interface
 
 uses
@@ -8,16 +12,18 @@ uses
 type
   TSharedMemoryStream = class(TWritableStaticMemoryStream)
   private
+    fMappingName:     String;
     fMappingSynchro:  THandle;  
     fMappingObject:   THandle;
   protected
     procedure Lock; virtual;
     procedure Unlock; virtual;
   public
-    constructor Create(Size: TMemSize; const MappingName: String = '');
+    constructor Create(InitSize: TMemSize; const MappingName: String = '');
     destructor Destroy; override;
     Function Read(var Buffer; Count: LongInt): LongInt; override;
     Function Write(const Buffer; Count: LongInt): LongInt; override;
+    property MappingName: String read fMappingName;
   end;
 
 implementation
@@ -44,7 +50,7 @@ end;
 
 //==============================================================================
 
-constructor TSharedMemoryStream.Create(Size: TMemSize; const MappingName: String);
+constructor TSharedMemoryStream.Create(InitSize: TMemSize; const MappingName: String);
 var
   MappingSynchro: THandle;
   MappingObject:  THandle;
@@ -55,16 +61,17 @@ MappingSynchro := CreateMutexW(nil,False,PWideChar(StrToWide(SMS_NAME_PREFIX_SYN
 If MappingSynchro = 0 then
   raise Exception.CreateFmt('TSharedMemoryStream.Create: Failed to create mutex (0x%.8x).',[GetLastError]);
 // create/open memory mapping
-MappingObject := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(Int64(Size) shr 32),
-  DWORD(Size),PWideChar(StrToWide(SMS_NAME_PREFIX_MAP + AnsiLowerCase(MappingName))));
+MappingObject := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(UInt64(InitSize) shr 32),
+  DWORD(InitSize),PWideChar(StrToWide(SMS_NAME_PREFIX_MAP + AnsiLowerCase(MappingName))));
 If MappingObject = 0 then
   raise Exception.CreateFmt('TSharedMemoryStream.Create: Failed to create mapping (0x%.8x).',[GetLastError]);
 // map memory
-MappedMemory := MapViewOfFile(MappingObject,FILE_MAP_ALL_ACCESS,0,0,Size);
+MappedMemory := MapViewOfFile(MappingObject,FILE_MAP_ALL_ACCESS,0,0,InitSize);
 If not Assigned(MappedMemory) then
   raise Exception.CreateFmt('TSharedMemoryStream.Create: Failed to map memory (0x%.8x).',[GetLastError]);
 // all is well, create the stream on top of the mapped memory
-inherited Create(MappedMemory,Size);
+inherited Create(MappedMemory,InitSize);
+fMappingName := MappingName;
 fMappingSynchro := MappingSynchro;
 fMappingObject := MappingObject;
 end;
