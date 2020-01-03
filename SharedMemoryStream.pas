@@ -17,14 +17,30 @@
     name is used, so all objects with empty name will access the same memory,
     even in different processes.
 
-  ©František Milt 2018-10-08
+  Version 1.0 (2020-01-03)
 
-  Version 1.0b (needs some testing)
+  Last change 2020-01-03
+
+  ©2018-2020 František Milt
+
+  Contacts:
+    František Milt: frantisek.milt@gmail.com
+
+  Support:
+    If you find this code useful, please consider supporting its author(s) by
+    making a small donation using the following link(s):
+
+      https://www.paypal.me/FMilt
+
+  Changelog:
+    For detailed changelog and history please refer to this git repository:
+
+      github.com/TheLazyTomcat/Lib.SharedMemoryStream
 
   Dependencies:
-    AuxTypes           - github.com/ncs-sniper/Lib.AuxTypes  
-    StaticMemoryStream - github.com/ncs-sniper/Lib.StaticMemoryStream
-    StrRect            - github.com/ncs-sniper/Lib.StrRect
+    AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
+    StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
+    StrRect            - github.com/TheLazyTomcat/Lib.StrRect
 
 ===============================================================================}
 unit SharedMemoryStream;
@@ -40,6 +56,7 @@ unit SharedMemoryStream;
 interface
 
 uses
+  SysUtils,
   AuxTypes, StaticMemoryStream;
 
 {===============================================================================
@@ -48,10 +65,14 @@ uses
 --------------------------------------------------------------------------------
 ===============================================================================}
 
+type
+  ESHMSException = class(Exception);
+
+  ESHMSSystemError = class(ESHMSException);
+
 {===============================================================================
     TSharedMemoryStream - class declaration
 ===============================================================================}
-
 type
   TSharedMemoryStream = class(TWritableStaticMemoryStream)
   private
@@ -72,7 +93,7 @@ type
 implementation
 
 uses
-  Windows, SysUtils,
+  Windows,
   StrRect;
 
 {===============================================================================
@@ -82,13 +103,12 @@ uses
 ===============================================================================}
 
 const
-  SMS_NAME_PREFIX_MAP  = 'sms_map_';
-  SMS_NAME_PREFIX_SYNC = 'sms_sync_';
+  SHMS_NAME_PREFIX_MAP  = 'shms_map_';
+  SHMS_NAME_PREFIX_SYNC = 'shms_sync_';
 
 {===============================================================================
     TSharedMemoryStream - class implementation
 ===============================================================================}
-
 {-------------------------------------------------------------------------------
     TSharedMemoryStream - protected methods
 -------------------------------------------------------------------------------}
@@ -116,18 +136,18 @@ var
   MappedMemory:   Pointer;
 begin
 // create/open synchronization mutex
-MappingSynchro := CreateMutexW(nil,False,PWideChar(StrToWide(SMS_NAME_PREFIX_SYNC + AnsiLowerCase(Name))));
+MappingSynchro := CreateMutexW(nil,False,PWideChar(StrToWide(SHMS_NAME_PREFIX_SYNC + AnsiLowerCase(Name))));
 If MappingSynchro = 0 then
-  raise Exception.CreateFmt('TSharedMemoryStream.Create: Failed to create mutex (0x%.8x).',[GetLastError]);
+  raise ESHMSSystemError.CreateFmt('TSharedMemoryStream.Create: Failed to create mutex (0x%.8x).',[GetLastError]);
 // create/open memory mapping
 MappingObject := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(UInt64(InitSize) shr 32),
-  DWORD(InitSize),PWideChar(StrToWide(SMS_NAME_PREFIX_MAP + AnsiLowerCase(Name))));
+  DWORD(InitSize),PWideChar(StrToWide(SHMS_NAME_PREFIX_MAP + AnsiLowerCase(Name))));
 If MappingObject = 0 then
-  raise Exception.CreateFmt('TSharedMemoryStream.Create: Failed to create mapping (0x%.8x).',[GetLastError]);
+  raise ESHMSSystemError.CreateFmt('TSharedMemoryStream.Create: Failed to create mapping (0x%.8x).',[GetLastError]);
 // map memory
 MappedMemory := MapViewOfFile(MappingObject,FILE_MAP_ALL_ACCESS,0,0,InitSize);
 If not Assigned(MappedMemory) then
-  raise Exception.CreateFmt('TSharedMemoryStream.Create: Failed to map memory (0x%.8x).',[GetLastError]);
+  raise ESHMSSystemError.CreateFmt('TSharedMemoryStream.Create: Failed to map memory (0x%.8x).',[GetLastError]);
 // all is well, create the stream on top of the mapped memory
 inherited Create(MappedMemory,InitSize);
 fName := Name;
