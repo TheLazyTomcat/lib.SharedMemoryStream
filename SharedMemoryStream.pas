@@ -19,7 +19,7 @@
 
   Version 1.0 (2020-01-03)
 
-  Last change 2020-01-03
+  Last change 2020-08-02
 
   ©2018-2020 František Milt
 
@@ -50,8 +50,9 @@ unit SharedMemoryStream;
 {$IFEND}
 
 {$IFDEF FPC}
-  {$MODE ObjFPC}{$H+}
+  {$MODE ObjFPC}
 {$ENDIF}
+{$H+}
 
 interface
 
