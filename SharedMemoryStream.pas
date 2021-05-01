@@ -24,7 +24,7 @@
 
   Version 1.1 (2021-04-29)
 
-  Last change 2021-04-29
+  Last change 2021-05-02
 
   ©2018-2021 František Milt
 
@@ -82,7 +82,8 @@ uses
 type
   ESHMSException = class(Exception);
 
-  ESHMSSystemError = class(ESHMSException);
+  ESHMSSystemError   = class(ESHMSException);
+  ESHMSRefCountError = class(ESHMSException); // used only in Linux
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -93,7 +94,7 @@ type
 type
   TSharedMemoryFooter = record
     Synchronizer: pthread_mutex_t;
-    RefCount:     Integer;
+    RefCount:     Int32;
   end;
   PSharedMemoryFooter = ^tSharedMemoryFooter;
 {$ENDIF}
@@ -113,9 +114,10 @@ type
   {$ELSE}
     fFullSize:    TMemSize;
     fFooterPtr:   PSharedMemoryFooter;
+    Function LockRefCount: Int32; virtual;
+    procedure InitializeMutex; virtual;
+    Function TryInitialize: Boolean; virtual;
   {$ENDIF}
-    procedure InitializeLock; virtual;
-    procedure FinalizeLock; virtual;
     procedure Initialize; virtual;
     procedure Finalize; virtual;
     class Function RectifyName(const Name: String): String; virtual;
@@ -183,6 +185,7 @@ const
 {$ELSE}
 
 Function errno_ptr: pcint; cdecl; external name '__errno_location';
+Function sched_yield: cint; cdecl; external;
 Function close(fd: cint): cint; cdecl; external;
 Function ftruncate(fd: cint; length: off_t): cint; cdecl; external;
 Function mmap(addr: Pointer; length: size_t; prot,flags,fd: cint; offset: off_t): Pointer; cdecl; external;
@@ -218,47 +221,14 @@ Function shm_unlink(name: pchar): cint; cdecl; external;
     TSharedMemory - protected methods
 -------------------------------------------------------------------------------}
 
-procedure TSharedMemory.InitializeLock;
 {$IFDEF Windows}
+
+procedure TSharedMemory.Initialize;
 begin
+// create/open synchronization mutex
 fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(fName + SHMS_NAME_SUFFIX_SYNC)));
 If fMappingSync = 0 then
   raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to create mutex (0x%.8x).',[GetLastError]);
-{$ELSE}
-var
-  MutexAttr:  pthread_mutexattr_t;
-begin
-If pthread_mutexattr_init(@MutexAttr) = 0 then
-  try
-    If pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED) <> 0 then
-      raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to set mutex attribute pshared (%d).',[errno_ptr^]);
-    If pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE) <> 0 then
-      raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to set mutex attribute type (%d).',[errno_ptr^]);
-    If pthread_mutex_init(Addr(fFooterPtr^.Synchronizer),@MutexAttr) <> 0 then
-      raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to init mutex (%d).',[errno_ptr^]);
-  finally
-    pthread_mutexattr_destroy(@MutexAttr);
-  end
-else raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to init mutex attributes (%d).',[errno_ptr^]);
-{$ENDIF}
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TSharedMemory.FinalizeLock;
-begin
-{$IFDEF Windows}
-CloseHandle(fMappingSync);
-{$ELSE}
-pthread_mutex_destroy(Addr(fFooterPtr^.Synchronizer));
-{$ENDIF}
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TSharedMemory.Initialize;
-{$IFDEF Windows}
-begin
 // create/open memory mapping
 fMappingObj := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(UInt64(fSize) shr 32),
                                   DWORD(fSize),PWideChar(StrToWide(fName + SHMS_NAME_SUFFIX_MAP)));
@@ -268,62 +238,20 @@ If fMappingObj = 0 then
 fMemory := MapViewOfFile(fMappingObj,FILE_MAP_ALL_ACCESS,0,0,fSize);
 If not Assigned(fMemory) then
   raise ESHMSSystemError.CreateFmt('TSharedMemory.Initialize: Failed to map memory (0x%.8x).',[GetLastError]);
-InitializeLock;
-{$ELSE}
-var
-  MappingObj: cint;
-begin
-// add aligned space for footer
-fFullSize := ((fSize + 15) and not TMemSize(15)) + SizeOf(TSharedMemoryFooter);
-// create/open mapping
-MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
-If MappingObj >= 0 then
-  try
-    If ftruncate(MappingObj,off_t(fFullSize)) < 0 then
-      raise ESHMSSystemError.CreateFmt('TSharedMemory.Initialize: Failed to truncate mapping (%d).',[errno_ptr^]);
-    // map file into memory
-    fMemory := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
-    If Assigned(fMemory) and (Memory <> Pointer(-1)) then
-      begin
-      {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
-        fFooterPtr := Pointer(PtrUInt(fMemory) + PtrUInt((fSize + 15) and not TMemSize(15)));
-      {$IFDEF FPCDWM}{$POP}{$ENDIF}
-        If InterlockedIncrement(fFooterPtr^.RefCount) <= 1 then
-          InitializeLock;
-      end
-    else raise ESHMSSystemError.CreateFmt('TSharedMemory.Initialize: Failed to map memory (%d).',[errno_ptr^]);
-  finally
-    close(MappingObj);
-  end
-else raise ESHMSSystemError.CreateFmt('TSharedMemory.Initialize: Failed to create mapping (%d).',[errno_ptr^]);
-{$ENDIF}
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TSharedMemory.Finalize;
 begin
-{$IFDEF Windows}
-FinalizeLock;
 UnmapViewOfFile(Memory);
 CloseHandle(fMappingObj);
-{$ELSE}
-If Assigned(fFooterPtr) then
-  If InterlockedDecrement(fFooterPtr^.RefCount) <= 0 then
-    begin
-      FinalizeLock;
-      // unlink mapping
-      shm_unlink(PChar(StrToSys(fName)));
-    end;
-If Assigned(fMemory) and (Memory <> Pointer(-1)) then
-  munmap(fMemory,size_t(fFullSize));
-{$ENDIF}
+CloseHandle(fMappingSync);
 end;
 
 //------------------------------------------------------------------------------
 
 class Function TSharedMemory.RectifyName(const Name: String): String;
-{$IFDEF Windows}
 var
   Start:  TStrSize;
   i:      Integer;
@@ -342,7 +270,162 @@ Result := Copy(Name,1,Pred(Start)) + AnsiLowerCase(Copy(Name,Start,Length(Name))
 For i := Start to Length(Result) do
   If Result[i] = '\' then
     Result[i] := '_';
-{$ELSE}
+end;
+
+{$ELSE}//=======================================================================
+
+// constants for reference counter
+const
+  SHMS_REFCNT_DMAX = -2;
+  SHMS_REFCNT_LOCK = -1;
+  SHMS_REFCNT_INIT = 0;
+  SHMS_REFCNT_RMAX = 2000000000;
+
+//------------------------------------------------------------------------------
+
+Function TSharedMemory.LockRefCount: Int32;
+begin
+repeat
+  Result := InterlockedExchange(fFooterPtr^.RefCount,SHMS_REFCNT_LOCK);
+  If Result = SHMS_REFCNT_LOCK then
+    sched_yield;  // ref counter was locked, wait a moment and try again
+until Result <> SHMS_REFCNT_LOCK;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSharedMemory.InitializeMutex;
+var
+  MutexAttr:  pthread_mutexattr_t;
+begin
+If pthread_mutexattr_init(@MutexAttr) = 0 then
+  try
+    If pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED) <> 0 then
+      raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to set mutex attribute pshared (%d).',[errno_ptr^]);
+    If pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE) <> 0 then
+      raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to set mutex attribute type (%d).',[errno_ptr^]);
+    If pthread_mutex_init(Addr(fFooterPtr^.Synchronizer),@MutexAttr) <> 0 then
+      raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to init mutex (%d).',[errno_ptr^]);
+  finally
+    pthread_mutexattr_destroy(@MutexAttr);
+  end
+else raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to init mutex attributes (%d).',[errno_ptr^]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSharedMemory.TryInitialize: Boolean;
+var
+  MappingObj:   cint;
+  OldRefCount:  Int32;
+begin
+Result := False;
+// add aligned space for footer
+fFullSize := ((fSize + 15) and not TMemSize(15)) + SizeOf(TSharedMemoryFooter);
+// create/open mapping
+MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
+If MappingObj >= 0 then
+  try
+    If ftruncate(MappingObj,off_t(fFullSize)) < 0 then
+      raise ESHMSSystemError.CreateFmt('TSharedMemory.TryInitialize: Failed to truncate mapping (%d).',[errno_ptr^]);
+    // map file into memory
+    fMemory := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
+    If Assigned(fMemory) and (Memory <> Pointer(-1)) then
+      begin
+      {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
+        fFooterPtr := Pointer(PtrUInt(fMemory) + PtrUInt((fSize + 15) and not TMemSize(15)));
+      {$IFDEF FPCDWM}{$POP}{$ENDIF}
+        OldRefCount := LockRefCount;
+        try
+          If OldRefCount <= SHMS_REFCNT_DMAX{-2} then
+            begin
+            {
+              The mapping was unlinked and mutex destroyed somewhere between
+              shm_open and LockRefCount - drop current mapping and start
+              mapping again from scratch.
+            }
+              munmap(fMemory,size_t(fFullSize));
+              InterlockedExchange(fFooterPtr^.RefCount,OldRefCount);
+            end
+          else If OldRefCount = SHMS_REFCNT_INIT{0} then
+            begin
+            {
+              This is the first time the mapping is accessed - create mutex and
+              set reference count to 1.
+            }
+              InitializeMutex;
+              InterlockedExchange(fFooterPtr^.RefCount,Succ(SHMS_REFCNT_INIT){1});
+              Result := True;
+            end
+          else If OldRefCount < SHMS_REFCNT_RMAX then
+            begin
+            {
+              The mapping and mutex is set up, only increase reference count.
+            }
+              InterlockedExchange(fFooterPtr^.RefCount,Succ(OldRefCount));
+              Result := True;
+            end
+          else raise ESHMSRefCountError.CreateFmt('TSharedMemory.TryInitialize: Invalid reference count (%d).',[OldRefCount]);
+        except
+          InterlockedExchange(fFooterPtr^.RefCount,OldRefCount);
+          raise;
+        end;
+      end
+    else raise ESHMSSystemError.CreateFmt('TSharedMemory.TryInitialize: Failed to map memory (%d).',[errno_ptr^]);
+  finally
+    close(MappingObj);
+  end
+else raise ESHMSSystemError.CreateFmt('TSharedMemory.TryInitialize: Failed to create mapping (%d).',[errno_ptr^]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSharedMemory.Initialize;
+begin
+while not TryInitialize do
+  sched_yield;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSharedMemory.Finalize;
+var
+  OldRefCount:  Int32;
+begin
+If Assigned(fFooterPtr) then
+  begin
+    OldRefCount := LockRefCount;
+    try
+      If (OldRefCount <= SHMS_REFCNT_RMAX) and (OldRefCount <> 0) then
+        begin
+        {
+          SHMS_REFCNT_LOCK (-1) is not possible here, other negative numbers
+          mean everything is already cleared, so do nothing in that case.
+        }
+          If OldRefCount = Succ(SHMS_REFCNT_INIT){1} then
+            begin
+              // destroy mutex
+              pthread_mutex_destroy(Addr(fFooterPtr^.Synchronizer));
+              // unlink mapping
+              shm_unlink(PChar(StrToSys(fName)));
+              InterlockedExchange(fFooterPtr^.RefCount,Low(Int32)); // destroyed
+            end
+          else If OldRefCount > Succ(SHMS_REFCNT_INIT) then
+            InterlockedExchange(fFooterPtr^.RefCount,Pred(OldRefCount));
+        end
+      else raise ESHMSRefCountError.CreateFmt('TSharedMemory.Finalize: Invalid reference count (%d).',[OldRefCount]);
+    except
+      InterlockedExchange(fFooterPtr^.RefCount,OldRefCount);
+      raise;
+    end;
+  end;
+If Assigned(fMemory) and (Memory <> Pointer(-1)) then
+  munmap(fMemory,size_t(fFullSize));
+end;
+
+//------------------------------------------------------------------------------
+
+class Function TSharedMemory.RectifyName(const Name: String): String;
 var
   i:  Integer;
 begin
@@ -362,8 +445,9 @@ If Length(Result) > NAME_MAX then
 For i := 2 to Length(Result) do
   If Result[i] = '/' then
     Result[i] := '_';
-{$ENDIF}
 end;
+
+{$ENDIF}
 
 {-------------------------------------------------------------------------------
     TSharedMemory - public methods
