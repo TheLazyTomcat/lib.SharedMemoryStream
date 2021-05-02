@@ -22,7 +22,7 @@
     name is used, so all objects with empty name will access the same memory,
     even in different processes.
 
-  Version 1.1 (2021-04-29)
+  Version 1.1.1 (2021-05-02)
 
   Last change 2021-05-02
 
@@ -92,11 +92,11 @@ type
 ===============================================================================}
 {$IFDEF Linux}
 type
-  TSharedMemoryFooter = record
+  TSharedMemoryHeader = record
     Synchronizer: pthread_mutex_t;
     RefCount:     Int32;
   end;
-  PSharedMemoryFooter = ^tSharedMemoryFooter;
+  PSharedMemoryHeader = ^tSharedMemoryHeader;
 {$ENDIF}
 
 {===============================================================================
@@ -112,8 +112,9 @@ type
     fMappingObj:  THandle;
     fMappingSync: THandle;
   {$ELSE}
+    fMemoryBase:  Pointer;
     fFullSize:    TMemSize;
-    fFooterPtr:   PSharedMemoryFooter;
+    fHeaderPtr:   PSharedMemoryHeader;
     Function LockRefCount: Int32; virtual;
     procedure InitializeMutex; virtual;
     Function TryInitialize: Boolean; virtual;
@@ -286,7 +287,7 @@ const
 Function TSharedMemory.LockRefCount: Int32;
 begin
 repeat
-  Result := InterlockedExchange(fFooterPtr^.RefCount,SHMS_REFCNT_LOCK);
+  Result := InterlockedExchange(fHeaderPtr^.RefCount,SHMS_REFCNT_LOCK);
   If Result = SHMS_REFCNT_LOCK then
     sched_yield;  // ref counter was locked, wait a moment and try again
 until Result <> SHMS_REFCNT_LOCK;
@@ -304,7 +305,7 @@ If pthread_mutexattr_init(@MutexAttr) = 0 then
       raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to set mutex attribute pshared (%d).',[errno_ptr^]);
     If pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE) <> 0 then
       raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to set mutex attribute type (%d).',[errno_ptr^]);
-    If pthread_mutex_init(Addr(fFooterPtr^.Synchronizer),@MutexAttr) <> 0 then
+    If pthread_mutex_init(Addr(fHeaderPtr^.Synchronizer),@MutexAttr) <> 0 then
       raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to init mutex (%d).',[errno_ptr^]);
   finally
     pthread_mutexattr_destroy(@MutexAttr);
@@ -321,7 +322,7 @@ var
 begin
 Result := False;
 // add aligned space for footer
-fFullSize := ((fSize + 15) and not TMemSize(15)) + SizeOf(TSharedMemoryFooter);
+fFullSize := ((fSize + 127) and not TMemSize(127)) + SizeOf(TSharedMemoryHeader);
 // create/open mapping
 MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
 If MappingObj >= 0 then
@@ -329,11 +330,12 @@ If MappingObj >= 0 then
     If ftruncate(MappingObj,off_t(fFullSize)) < 0 then
       raise ESHMSSystemError.CreateFmt('TSharedMemory.TryInitialize: Failed to truncate mapping (%d).',[errno_ptr^]);
     // map file into memory
-    fMemory := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
-    If Assigned(fMemory) and (Memory <> Pointer(-1)) then
+    fMemoryBase := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
+    If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1)) then
       begin
+        fHeaderPtr := fMemoryBase;
       {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
-        fFooterPtr := Pointer(PtrUInt(fMemory) + PtrUInt((fSize + 15) and not TMemSize(15)));
+        fMemory := Pointer(PtrUInt(fMemoryBase) + PtrUInt((fSize + 127) and not TMemSize(127)));
       {$IFDEF FPCDWM}{$POP}{$ENDIF}
         OldRefCount := LockRefCount;
         try
@@ -344,8 +346,8 @@ If MappingObj >= 0 then
               shm_open and LockRefCount - drop current mapping and start
               mapping again from scratch.
             }
-              munmap(fMemory,size_t(fFullSize));
-              InterlockedExchange(fFooterPtr^.RefCount,OldRefCount);
+              munmap(fMemoryBase,size_t(fFullSize));
+              InterlockedExchange(fHeaderPtr^.RefCount,OldRefCount);
             end
           else If OldRefCount = SHMS_REFCNT_INIT{0} then
             begin
@@ -354,7 +356,7 @@ If MappingObj >= 0 then
               set reference count to 1.
             }
               InitializeMutex;
-              InterlockedExchange(fFooterPtr^.RefCount,Succ(SHMS_REFCNT_INIT){1});
+              InterlockedExchange(fHeaderPtr^.RefCount,Succ(SHMS_REFCNT_INIT){1});
               Result := True;
             end
           else If OldRefCount < SHMS_REFCNT_RMAX then
@@ -362,12 +364,12 @@ If MappingObj >= 0 then
             {
               The mapping and mutex is set up, only increase reference count.
             }
-              InterlockedExchange(fFooterPtr^.RefCount,Succ(OldRefCount));
+              InterlockedExchange(fHeaderPtr^.RefCount,Succ(OldRefCount));
               Result := True;
             end
           else raise ESHMSRefCountError.CreateFmt('TSharedMemory.TryInitialize: Invalid reference count (%d).',[OldRefCount]);
         except
-          InterlockedExchange(fFooterPtr^.RefCount,OldRefCount);
+          InterlockedExchange(fHeaderPtr^.RefCount,OldRefCount);
           raise;
         end;
       end
@@ -392,7 +394,7 @@ procedure TSharedMemory.Finalize;
 var
   OldRefCount:  Int32;
 begin
-If Assigned(fFooterPtr) then
+If Assigned(fHeaderPtr) then
   begin
     OldRefCount := LockRefCount;
     try
@@ -404,23 +406,23 @@ If Assigned(fFooterPtr) then
         }
           If OldRefCount = Succ(SHMS_REFCNT_INIT){1} then
             begin
-              // destroy mutex
-              pthread_mutex_destroy(Addr(fFooterPtr^.Synchronizer));
-              // unlink mapping
+              // destroy mutex (ignore errors)
+              pthread_mutex_destroy(Addr(fHeaderPtr^.Synchronizer));
+              // unlink mapping (ignore errors)
               shm_unlink(PChar(StrToSys(fName)));
-              InterlockedExchange(fFooterPtr^.RefCount,Low(Int32)); // destroyed
+              InterlockedExchange(fHeaderPtr^.RefCount,Low(Int32)); // destroyed
             end
           else If OldRefCount > Succ(SHMS_REFCNT_INIT) then
-            InterlockedExchange(fFooterPtr^.RefCount,Pred(OldRefCount));
+            InterlockedExchange(fHeaderPtr^.RefCount,Pred(OldRefCount));
         end
       else raise ESHMSRefCountError.CreateFmt('TSharedMemory.Finalize: Invalid reference count (%d).',[OldRefCount]);
     except
-      InterlockedExchange(fFooterPtr^.RefCount,OldRefCount);
+      InterlockedExchange(fHeaderPtr^.RefCount,OldRefCount);
       raise;
     end;
   end;
-If Assigned(fMemory) and (Memory <> Pointer(-1)) then
-  munmap(fMemory,size_t(fFullSize));
+If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1)) then
+  munmap(fMemoryBase,size_t(fFullSize));
 end;
 
 //------------------------------------------------------------------------------
@@ -477,7 +479,7 @@ begin
 If not(WaitForSingleObject(fMappingSync,INFINITE) in [WAIT_ABANDONED,WAIT_OBJECT_0]) then
   raise ESHMSSystemError.Create('TSharedMemory.Lock: Failed to lock.');  ;
 {$ELSE}
-If pthread_mutex_lock(Addr(fFooterPtr^.Synchronizer)) <> 0 then
+If pthread_mutex_lock(Addr(fHeaderPtr^.Synchronizer)) <> 0 then
   raise ESHMSSystemError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[errno_ptr^]);
 {$ENDIF}
 end;
@@ -489,7 +491,8 @@ begin
 {$IFDEF Windows}
 ReleaseMutex(fMappingSync);
 {$ELSE}
-pthread_mutex_unlock(Addr(fFooterPtr^.Synchronizer))
+If pthread_mutex_unlock(Addr(fHeaderPtr^.Synchronizer)) <> 0 then
+  raise ESHMSSystemError.CreateFmt('TSharedMemory.Lock: Failed to unlock (%d).',[errno_ptr^]);
 {$ENDIF}
 end;
 
