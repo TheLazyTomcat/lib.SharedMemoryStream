@@ -22,9 +22,9 @@
     name is used, so all objects with empty name will access the same memory,
     even in different processes.
 
-  Version 1.1.1 (2021-05-02)
+  Version 1.1.2 (2021-05-03)
 
-  Last change 2021-05-02
+  Last change 2021-05-03
 
   ©2018-2021 František Milt
 
@@ -158,7 +158,7 @@ type
 implementation
 
 uses
-  {$IFDEF Windows}Windows,{$ELSE}unixtype,{$ENDIF} StrUtils,
+  {$IFDEF Windows}Windows,{$ELSE}unixtype, StrUtils,{$ENDIF}
   StrRect;
 
 {$IFDEF Linux}
@@ -254,23 +254,22 @@ end;
 
 class Function TSharedMemory.RectifyName(const Name: String): String;
 var
-  Start:  TStrSize;
-  i:      Integer;
+  i,Cnt:  Integer;
 begin
 {
-  The name cannot contain backslash, unless it separates Local or Global prefix.
-  Replace backslashes by underscores and convert to lower case.
+  There can be exactly one backslash (separating namespace prefix).
+  Replace other backslashes by underscores and convert to lower case. Do not
+  limit length.
 }
-If AnsiStartsText('Local\',Name) then
-  Start := 7
-else If AnsiStartsText('Global\',Name) then
-  Start := 8
-else
-  Start := 1;
-Result := Copy(Name,1,Pred(Start)) + AnsiLowerCase(Copy(Name,Start,Length(Name)));
-For i := Start to Length(Result) do
+Result := AnsiLowerCase(Name);
+Cnt := 0;
+For i := 1 to Length(Result) do
   If Result[i] = '\' then
-    Result[i] := '_';
+    begin
+      If Cnt > 0 then
+        Result[i] := '_';
+      Inc(Cnt);
+    end;
 end;
 
 {$ELSE}//=======================================================================
