@@ -22,9 +22,9 @@
     name is used, so all objects with empty name will access the same memory,
     even in different processes.
 
-  Version 1.1.2 (2021-05-03)
+  Version 1.1.3 (2021-11-08)
 
-  Last change 2021-05-03
+  Last change 2021-11-08
 
   ©2018-2021 František Milt
 
@@ -46,6 +46,16 @@
     AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
     StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
     StrRect            - github.com/TheLazyTomcat/Lib.StrRect
+  * AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
+  * SimpleCPUID        - github.com/TheLazyTomcat/Lib.SimpleCPUID
+  * InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
+  * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex
+
+  Libraries SimpleFutex, AuxClasses, InterlockedOps and SimpleCPUID are
+  required only when compiling for Linux operating system.
+
+  SimpleCPUID might not be required, depending on defined symbols in library
+  InterlockedOps.
 
 ===============================================================================}
 unit SharedMemoryStream;
@@ -76,14 +86,22 @@ unit SharedMemoryStream;
 interface
 
 uses
-  SysUtils, {$IFDEF Linux}baseunix,{$ENDIF}
-  AuxTypes, StaticMemoryStream;
+  SysUtils, Classes, {$IFDEF Linux}baseunix,{$ENDIF}
+  AuxTypes, StaticMemoryStream{$IFDEF Linux}, SimpleFutex{$ENDIF};
 
+{===============================================================================
+    Library-specific exceptions
+===============================================================================}
 type
   ESHMSException = class(Exception);
 
-  ESHMSSystemError   = class(ESHMSException);
-  ESHMSRefCountError = class(ESHMSException); // used only in Linux
+  ESHMSMutexCreationError   = class(ESHMSException);
+  ESHMSMappingCreationError = class(ESHMSException);
+  ESHMSMappingTruncateError = class(ESHMSException);  // linux only
+  ESHMSMemoryMappingError   = class(ESHMSException);
+
+  ESHMSLockError   = class(ESHMSException);
+  ESHMSUnlockError = class(ESHMSException);
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -93,10 +111,11 @@ type
 {$IFDEF Linux}
 type
   TSharedMemoryHeader = record
-    Synchronizer: pthread_mutex_t;
+    RefLock:      TFutex;
     RefCount:     Int32;
+    Synchronizer: pthread_mutex_t;
   end;
-  PSharedMemoryHeader = ^tSharedMemoryHeader;
+  PSharedMemoryHeader = ^TSharedMemoryHeader;
 {$ENDIF}
 
 {===============================================================================
@@ -115,7 +134,6 @@ type
     fMemoryBase:  Pointer;
     fFullSize:    TMemSize;
     fHeaderPtr:   PSharedMemoryHeader;
-    Function LockRefCount: Int32; virtual;
     procedure InitializeMutex; virtual;
     Function TryInitialize: Boolean; virtual;
   {$ENDIF}
@@ -229,16 +247,16 @@ begin
 // create/open synchronization mutex
 fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(fName + SHMS_NAME_SUFFIX_SYNC)));
 If fMappingSync = 0 then
-  raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to create mutex (0x%.8x).',[GetLastError]);
+  raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mutex (0x%.8x).',[GetLastError]);
 // create/open memory mapping
 fMappingObj := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(UInt64(fSize) shr 32),
                                   DWORD(fSize),PWideChar(StrToWide(fName + SHMS_NAME_SUFFIX_MAP)));
 If fMappingObj = 0 then
-  raise ESHMSSystemError.CreateFmt('TSharedMemory.Initialize: Failed to create mapping (0x%.8x).',[GetLastError]);
+  raise ESHMSMappingCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mapping (0x%.8x).',[GetLastError]);
 // map memory
 fMemory := MapViewOfFile(fMappingObj,FILE_MAP_ALL_ACCESS,0,0,fSize);
 If not Assigned(fMemory) then
-  raise ESHMSSystemError.CreateFmt('TSharedMemory.Initialize: Failed to map memory (0x%.8x).',[GetLastError]);
+  raise ESHMSMemoryMappingError.CreateFmt('TSharedMemory.Initialize: Failed to map memory (0x%.8x).',[GetLastError]);
 end;
 
 //------------------------------------------------------------------------------
@@ -274,26 +292,6 @@ end;
 
 {$ELSE}//=======================================================================
 
-// constants for reference counter
-const
-  SHMS_REFCNT_DMAX = -2;
-  SHMS_REFCNT_LOCK = -1;
-  SHMS_REFCNT_INIT = 0;
-  SHMS_REFCNT_RMAX = 2000000000;
-
-//------------------------------------------------------------------------------
-
-Function TSharedMemory.LockRefCount: Int32;
-begin
-repeat
-  Result := InterlockedExchange(fHeaderPtr^.RefCount,SHMS_REFCNT_LOCK);
-  If Result = SHMS_REFCNT_LOCK then
-    sched_yield;  // ref counter was locked, wait a moment and try again
-until Result <> SHMS_REFCNT_LOCK;
-end;
-
-//------------------------------------------------------------------------------
-
 procedure TSharedMemory.InitializeMutex;
 var
   MutexAttr:  pthread_mutexattr_t;
@@ -301,82 +299,73 @@ begin
 If pthread_mutexattr_init(@MutexAttr) = 0 then
   try
     If pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED) <> 0 then
-      raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to set mutex attribute pshared (%d).',[errno_ptr^]);
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute pshared (%d).',[errno_ptr^]);
     If pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE) <> 0 then
-      raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to set mutex attribute type (%d).',[errno_ptr^]);
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute type (%d).',[errno_ptr^]);
     If pthread_mutex_init(Addr(fHeaderPtr^.Synchronizer),@MutexAttr) <> 0 then
-      raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to init mutex (%d).',[errno_ptr^]);
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex (%d).',[errno_ptr^]);
   finally
     pthread_mutexattr_destroy(@MutexAttr);
   end
-else raise ESHMSSystemError.CreateFmt('TSharedMemory.InitializeLock: Failed to init mutex attributes (%d).',[errno_ptr^]);
+else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex attributes (%d).',[errno_ptr^]);
 end;
 
 //------------------------------------------------------------------------------
 
 Function TSharedMemory.TryInitialize: Boolean;
 var
-  MappingObj:   cint;
-  OldRefCount:  Int32;
+  MappingObj: cint;
 begin
 Result := False;
 // add aligned space for footer
-fFullSize := ((fSize + 127) and not TMemSize(127)) + SizeOf(TSharedMemoryHeader);
+fFullSize := (TMemSize(SizeOf(TSharedMemoryHeader) + 127) and not TMemSize(127)) + fSize;
 // create/open mapping
 MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
 If MappingObj >= 0 then
   try
     If ftruncate(MappingObj,off_t(fFullSize)) < 0 then
-      raise ESHMSSystemError.CreateFmt('TSharedMemory.TryInitialize: Failed to truncate mapping (%d).',[errno_ptr^]);
+      raise ESHMSMappingTruncateError.CreateFmt('TSharedMemory.Initialize: Failed to truncate mapping (%d).',[errno_ptr^]);
     // map file into memory
     fMemoryBase := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
-    If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1)) then
+    If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1){MAP_FAILED}) then
       begin
         fHeaderPtr := fMemoryBase;
       {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
-        fMemory := Pointer(PtrUInt(fMemoryBase) + PtrUInt((fSize + 127) and not TMemSize(127)));
+        fMemory := Pointer(PtrUInt(fMemoryBase) + (PtrUInt(SizeOf(TSharedMemoryHeader) + 127) and not PtrUInt(127)));
       {$IFDEF FPCDWM}{$POP}{$ENDIF}
-        OldRefCount := LockRefCount;
+        SimpleFutexLock(fHeaderPtr^.RefLock);
         try
-          If OldRefCount <= SHMS_REFCNT_DMAX{-2} then
-            begin
-            {
-              The mapping was unlinked and mutex destroyed somewhere between
-              shm_open and LockRefCount - drop current mapping and start
-              mapping again from scratch.
-            }
-              munmap(fMemoryBase,size_t(fFullSize));
-              InterlockedExchange(fHeaderPtr^.RefCount,OldRefCount);
-            end
-          else If OldRefCount = SHMS_REFCNT_INIT{0} then
+          If fHeaderPtr^.RefCount = 0 then
             begin
             {
               This is the first time the mapping is accessed - create mutex and
               set reference count to 1.
             }
               InitializeMutex;
-              InterlockedExchange(fHeaderPtr^.RefCount,Succ(SHMS_REFCNT_INIT){1});
-              Result := True;
+              fHeaderPtr^.RefCount := 1;
+              Result := True
             end
-          else If OldRefCount < SHMS_REFCNT_RMAX then
+          else If fHeaderPtr^.RefCount > 0 then
             begin
-            {
-              The mapping and mutex is set up, only increase reference count.
-            }
-              InterlockedExchange(fHeaderPtr^.RefCount,Succ(OldRefCount));
+              // The mapping and mutex is set up, only increase reference count.
+              Inc(fHeaderPtr^.RefCount);
               Result := True;
             end
-          else raise ESHMSRefCountError.CreateFmt('TSharedMemory.TryInitialize: Invalid reference count (%d).',[OldRefCount]);
-        except
-          InterlockedExchange(fHeaderPtr^.RefCount,OldRefCount);
-          raise;
+        {
+          The mapping was unlinked and mutex destroyed somewhere between
+          shm_open and SimpleFutexLock - drop current mapping and start mapping
+          again from scratch.
+        }
+          else munmap(fMemoryBase,size_t(fFullSize));
+        finally
+          SimpleFutexUnlock(fHeaderPtr^.RefLock);
         end;
       end
-    else raise ESHMSSystemError.CreateFmt('TSharedMemory.TryInitialize: Failed to map memory (%d).',[errno_ptr^]);
+    else raise ESHMSMemoryMappingError.CreateFmt('TSharedMemory.Initialize: Failed to map memory (%d).',[errno_ptr^]);
   finally
     close(MappingObj);
   end
-else raise ESHMSSystemError.CreateFmt('TSharedMemory.TryInitialize: Failed to create mapping (%d).',[errno_ptr^]);
+else raise ESHMSMappingCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mapping (%d).',[errno_ptr^]);
 end;
 
 //------------------------------------------------------------------------------
@@ -390,36 +379,48 @@ end;
 //------------------------------------------------------------------------------
 
 procedure TSharedMemory.Finalize;
-var
-  OldRefCount:  Int32;
 begin
+{
+  If there was exception in the constructor, the header pointer might not be
+  set by this point.
+}
 If Assigned(fHeaderPtr) then
   begin
-    OldRefCount := LockRefCount;
+    SimpleFutexLock(fHeaderPtr^.RefLock);
     try
-      If (OldRefCount <= SHMS_REFCNT_RMAX) and (OldRefCount <> 0) then
+      If fHeaderPtr^.RefCount = 0 then
         begin
         {
-          SHMS_REFCNT_LOCK (-1) is not possible here, other negative numbers
-          mean everything is already cleared, so do nothing in that case.
+          Zero should be possible only if the initialization failed when
+          creating the mutex.
+          Unlink the mapping but do not destroy mutex (it should not exist).
         }
-          If OldRefCount = Succ(SHMS_REFCNT_INIT){1} then
-            begin
-              // destroy mutex (ignore errors)
-              pthread_mutex_destroy(Addr(fHeaderPtr^.Synchronizer));
-              // unlink mapping (ignore errors)
-              shm_unlink(PChar(StrToSys(fName)));
-              InterlockedExchange(fHeaderPtr^.RefCount,Low(Int32)); // destroyed
-            end
-          else If OldRefCount > Succ(SHMS_REFCNT_INIT) then
-            InterlockedExchange(fHeaderPtr^.RefCount,Pred(OldRefCount));
+          fHeaderPtr^.RefCount := -1;
+          shm_unlink(PChar(StrToSys(fName)));
         end
-      else raise ESHMSRefCountError.CreateFmt('TSharedMemory.Finalize: Invalid reference count (%d).',[OldRefCount]);
-    except
-      InterlockedExchange(fHeaderPtr^.RefCount,OldRefCount);
-      raise;
+      else If fHeaderPtr^.RefCount = 1 then
+        begin
+        {
+          This is the last instance, destroy mutex and unlink the mapping.
+          Set reference counter to -1 to indicate it is being destroyed.
+        }
+          fHeaderPtr^.RefCount := -1;
+          // destroy mutex (ignore errors)
+          pthread_mutex_destroy(Addr(fHeaderPtr^.Synchronizer));
+          // unlink mapping (ignore errors)
+          shm_unlink(PChar(StrToSys(fName)));
+        end
+      else If fHeaderPtr^.RefCount > 1 then
+        Dec(fHeaderPtr^.RefCount);
+      {
+        Negative value means the mapping is already being destroyed elsewhere,
+        so do nothing.
+      }
+    finally
+      SimpleFutexUnlock(fHeaderPtr^.RefLock);
     end;
   end;
+// unmapping is done in any case...
 If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1)) then
   munmap(fMemoryBase,size_t(fFullSize));
 end;
@@ -434,7 +435,7 @@ begin
   The name must start with forward slash and must not contain any more fwd.
   slashes.
   Check if there is leading slash and add it when isn't, replace other slashes
-  by underscores and convert to lower case. Also limit the length to NAME_MAX
+  with underscores and convert to lower case. Also limit the length to NAME_MAX
   characters.
 }
 If not AnsiStartsText('/',Name) then
@@ -476,10 +477,10 @@ procedure TSharedMemory.Lock;
 begin
 {$IFDEF Windows}
 If not(WaitForSingleObject(fMappingSync,INFINITE) in [WAIT_ABANDONED,WAIT_OBJECT_0]) then
-  raise ESHMSSystemError.Create('TSharedMemory.Lock: Failed to lock.');  ;
+  raise ESHMSLockError.Create('TSharedMemory.Lock: Failed to lock.');  ;
 {$ELSE}
 If pthread_mutex_lock(Addr(fHeaderPtr^.Synchronizer)) <> 0 then
-  raise ESHMSSystemError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[errno_ptr^]);
+  raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[errno_ptr^]);
 {$ENDIF}
 end;
 
@@ -491,7 +492,7 @@ begin
 ReleaseMutex(fMappingSync);
 {$ELSE}
 If pthread_mutex_unlock(Addr(fHeaderPtr^.Synchronizer)) <> 0 then
-  raise ESHMSSystemError.CreateFmt('TSharedMemory.Lock: Failed to unlock (%d).',[errno_ptr^]);
+  raise ESHMSUnlockError.CreateFmt('TSharedMemory.Lock: Failed to unlock (%d).',[errno_ptr^]);
 {$ENDIF}
 end;
 
