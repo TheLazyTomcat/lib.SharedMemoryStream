@@ -22,9 +22,9 @@
     name is used, so all objects with empty name will access the same memory,
     even in different processes.
 
-  Version 1.1.3 (2021-11-08)
+  Version 1.1.4 (2021-11-29)
 
-  Last change 2021-11-08
+  Last change 2021-11-29
 
   ©2018-2021 František Milt
 
@@ -198,8 +198,8 @@ uses
 {$IFDEF Windows}
 
 const
-  SHMS_NAME_SUFFIX_MAP  = '_shms_map';
-  SHMS_NAME_SUFFIX_SYNC = '_shms_sync';
+  SHMS_NAME_PREFIX_MAP  = 'shms_map_';
+  SHMS_NAME_PREFIX_SYNC = 'shms_sync_';
 
 {$ELSE}
 
@@ -245,12 +245,12 @@ Function shm_unlink(name: pchar): cint; cdecl; external;
 procedure TSharedMemory.Initialize;
 begin
 // create/open synchronization mutex
-fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(fName + SHMS_NAME_SUFFIX_SYNC)));
+fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(SHMS_NAME_PREFIX_SYNC + fName)));
 If fMappingSync = 0 then
   raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mutex (0x%.8x).',[GetLastError]);
 // create/open memory mapping
 fMappingObj := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(UInt64(fSize) shr 32),
-                                  DWORD(fSize),PWideChar(StrToWide(fName + SHMS_NAME_SUFFIX_MAP)));
+                                  DWORD(fSize),PWideChar(StrToWide(SHMS_NAME_PREFIX_MAP + fName)));
 If fMappingObj = 0 then
   raise ESHMSMappingCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mapping (0x%.8x).',[GetLastError]);
 // map memory
