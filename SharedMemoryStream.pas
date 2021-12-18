@@ -35,7 +35,7 @@
 
   Version 1.2 (2021-12-18)
 
-  Last change 2021-12-18
+  Last change 2021-12-19
 
   ©2018-2021 František Milt
 
@@ -368,7 +368,7 @@ var
   MappingObj: cint;
 begin
 Result := False;
-// add aligned space for footer
+// add space for header
 fFullSize := (TMemSize(SizeOf(TSharedMemoryHeader) + 127) and not TMemSize(127)) + fSize;
 // create/open mapping
 MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
