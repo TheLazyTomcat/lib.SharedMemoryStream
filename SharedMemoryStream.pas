@@ -9,22 +9,33 @@
 
   Shared memory stream
 
-    Simple class that provides a way of accessing shared (system-wide) memory
-    using standard stream interface.
-    The actual shared memory is implemented in TSharedMemory class and
-    TSharedMemoryStream is just a stream-interface wrapper around it.
-
-    For the sake of data integrity, all access to shared memory in the stream
-    is protected by locks (mutex).
+    Provides classes for accessing shared (system-wide) memory, possibly using
+    standard stream interface.
 
     Sharing of the memory is based on the name - same name (case-insensitive)
-    results in access to the same memory. If you leave the name empty, a default
-    name is used, so all objects with empty name will access the same memory,
-    even in different processes.
+    results in access to the same memory. For the sake of sanity, it is not
+    allowed to use an empty name.
 
-  Version 1.1.4 (2021-11-29)
+    The actual shared memory is implemented in T(Simple)SharedMemory classes
+    and T(Simple)SharedMemoryStream are just stream-interface wrappers around
+    them.
+    Classes with "simple" in name do not provide any locking, others can be
+    locked (methods Lock and Unlock) to prevent data corruption (internally
+    implemented via mutex). Simple classes are provided for situations where
+    locking is not needed or is implemented by external means.
 
-  Last change 2021-11-29
+      NOTE - in Windows OS for non-simple classes, the name of mapping is
+             prefixed and is therefore not exactly the same as the name given
+             in creation. This is done because the same name is used for named
+             mutex used in locking, but Windows do not allow two different
+             objects to have the same name.
+
+    In non-simple streams, the methods Read and Write are protected by a lock,
+    so it is not necessary to lock the access explicitly.
+
+  Version 1.2 (2021-12-18)
+
+  Last change 2021-12-18
 
   ©2018-2021 František Milt
 
@@ -44,15 +55,15 @@
 
   Dependencies:
     AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
+    AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
     StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
     StrRect            - github.com/TheLazyTomcat/Lib.StrRect
-  * AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
   * SimpleCPUID        - github.com/TheLazyTomcat/Lib.SimpleCPUID
   * InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
   * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex
 
-  Libraries SimpleFutex, AuxClasses, InterlockedOps and SimpleCPUID are
-  required only when compiling for Linux operating system.
+  Libraries SimpleFutex, InterlockedOps and SimpleCPUID are required only when
+  compiling for Linux operating system.
 
   SimpleCPUID might not be required, depending on defined symbols in library
   InterlockedOps.
@@ -78,6 +89,7 @@ unit SharedMemoryStream;
 
 {$IFDEF FPC}
   {$MODE ObjFPC}
+  {$MODESWITCH DuplicateLocals+}
   {$DEFINE FPC_DisableWarns}
   {$MACRO ON}
 {$ENDIF}
@@ -87,7 +99,7 @@ interface
 
 uses
   SysUtils, Classes, {$IFDEF Linux}baseunix,{$ENDIF}
-  AuxTypes, StaticMemoryStream{$IFDEF Linux}, SimpleFutex{$ENDIF};
+  AuxTypes, AuxClasses, StaticMemoryStream{$IFDEF Linux}, SimpleFutex{$ENDIF};
 
 {===============================================================================
     Library-specific exceptions
@@ -95,6 +107,7 @@ uses
 type
   ESHMSException = class(Exception);
 
+  ESHMSInvalidValue         = class(ESHMSException);
   ESHMSMutexCreationError   = class(ESHMSException);
   ESHMSMappingCreationError = class(ESHMSException);
   ESHMSMappingTruncateError = class(ESHMSException);  // linux only
@@ -105,7 +118,7 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                                 TSharedMemory
+                               TSimpleSharedMemory
 --------------------------------------------------------------------------------
 ===============================================================================}
 {$IFDEF Linux}
@@ -119,22 +132,23 @@ type
 {$ENDIF}
 
 {===============================================================================
-    TSharedMemory - class declaration
+    TSimpleSharedMemory - class declaration
 ===============================================================================}
 type
-  TSharedMemory = class(TObject)
+  TSimpleSharedMemory = class(TCustomObject)
   protected
     fName:        String;
     fMemory:      Pointer;
     fSize:        TMemSize;
   {$IFDEF Windows}
     fMappingObj:  THandle;
-    fMappingSync: THandle;
+    class Function GetMappingPrefix: String; virtual;
   {$ELSE}
     fMemoryBase:  Pointer;
     fFullSize:    TMemSize;
     fHeaderPtr:   PSharedMemoryHeader;
     procedure InitializeMutex; virtual;
+    procedure FinalizeMutex; virtual;
     Function TryInitialize: Boolean; virtual;
   {$ENDIF}
     procedure Initialize; virtual;
@@ -143,11 +157,56 @@ type
   public
     constructor Create(InitSize: TMemSize; const Name: String);
     destructor Destroy; override;
-    procedure Lock; virtual;
-    procedure Unlock; virtual;
     property Name: String read fName;
     property Memory: Pointer read fMemory;
     property Size: TMemSize read fSize;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 TSharedMemory
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSharedMemory - class declaration
+===============================================================================}
+type
+  TSharedMemory = class(TSimpleSharedMemory)
+  protected
+  {$IFDEF Windows}
+    fMappingSync: THandle;
+    class Function GetMappingPrefix: String; override;
+    procedure Initialize; override;
+    procedure Finalize; override;
+  {$ELSE}
+    procedure InitializeMutex; override;
+    procedure FinalizeMutex; override;
+  {$ENDIF}
+  public
+    procedure Lock; virtual;
+    procedure Unlock; virtual;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                            TSimpleSharedMemoryStream
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSimpleSharedMemoryStream - class declaration
+===============================================================================}
+type
+  TSimpleSharedMemoryStream = class(TWritableStaticMemoryStream)
+  protected
+    fSharedMemory:  TSimpleSharedMemory;
+    Function GetName: String; virtual;
+    class Function GetSharedMemoryInstance(InitSize: TMemSize; const Name: String): TSimpleSharedMemory; virtual;
+  public
+    constructor Create(InitSize: TMemSize; const Name: String);
+    destructor Destroy; override;
+    Function Read(var Buffer; Count: LongInt): LongInt; override;
+    Function Write(const Buffer; Count: LongInt): LongInt; override;
+    property Name: String read GetName;
   end;
 
 {===============================================================================
@@ -159,18 +218,14 @@ type
     TSharedMemoryStream - class declaration
 ===============================================================================}
 type
-  TSharedMemoryStream = class(TWritableStaticMemoryStream)
+  TSharedMemoryStream = class(TSimpleSharedMemoryStream)
   protected
-    fSharedMemory:  TSharedMemory;
-    Function GetName: String; virtual;
+    class Function GetSharedMemoryInstance(InitSize: TMemSize; const Name: String): TSimpleSharedMemory; override;
   public
-    constructor Create(InitSize: TMemSize; const Name: String = '');
-    destructor Destroy; override;
-    Function Read(var Buffer; Count: LongInt): LongInt; override;
-    Function Write(const Buffer; Count: LongInt): LongInt; override;
     procedure Lock; virtual;
     procedure Unlock; virtual;
-    property Name: String read GetName;
+    Function Read(var Buffer; Count: LongInt): LongInt; override;
+    Function Write(const Buffer; Count: LongInt): LongInt; override;
   end;
 
 implementation
@@ -192,7 +247,7 @@ uses
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                                 TSharedMemory
+                               TSimpleSharedMemory
 --------------------------------------------------------------------------------
 ===============================================================================}
 {$IFDEF Windows}
@@ -234,43 +289,45 @@ Function shm_unlink(name: pchar): cint; cdecl; external;
 {$ENDIF}
 
 {===============================================================================
-    TSharedMemory - class implementation
+    TSimpleSharedMemory - class implementation
 ===============================================================================}
 {-------------------------------------------------------------------------------
-    TSharedMemory - protected methods
+    TSimpleSharedMemory - protected methods
 -------------------------------------------------------------------------------}
 
 {$IFDEF Windows}
 
-procedure TSharedMemory.Initialize;
+class Function TSimpleSharedMemory.GetMappingPrefix: String;
 begin
-// create/open synchronization mutex
-fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(SHMS_NAME_PREFIX_SYNC + fName)));
-If fMappingSync = 0 then
-  raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mutex (0x%.8x).',[GetLastError]);
+Result := '';
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSimpleSharedMemory.Initialize;
+begin
 // create/open memory mapping
 fMappingObj := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(UInt64(fSize) shr 32),
-                                  DWORD(fSize),PWideChar(StrToWide(SHMS_NAME_PREFIX_MAP + fName)));
+                                  DWORD(fSize),PWideChar(StrToWide(GetMappingPrefix + fName)));
 If fMappingObj = 0 then
-  raise ESHMSMappingCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mapping (0x%.8x).',[GetLastError]);
+  raise ESHMSMappingCreationError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to create mapping (0x%.8x).',[GetLastError]);
 // map memory
 fMemory := MapViewOfFile(fMappingObj,FILE_MAP_ALL_ACCESS,0,0,fSize);
 If not Assigned(fMemory) then
-  raise ESHMSMemoryMappingError.CreateFmt('TSharedMemory.Initialize: Failed to map memory (0x%.8x).',[GetLastError]);
+  raise ESHMSMemoryMappingError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to map memory (0x%.8x).',[GetLastError]);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSharedMemory.Finalize;
+procedure TSimpleSharedMemory.Finalize;
 begin
 UnmapViewOfFile(Memory);
 CloseHandle(fMappingObj);
-CloseHandle(fMappingSync);
 end;
 
 //------------------------------------------------------------------------------
 
-class Function TSharedMemory.RectifyName(const Name: String): String;
+class Function TSimpleSharedMemory.RectifyName(const Name: String): String;
 var
   i,Cnt:  Integer;
 begin
@@ -292,27 +349,21 @@ end;
 
 {$ELSE}//=======================================================================
 
-procedure TSharedMemory.InitializeMutex;
-var
-  MutexAttr:  pthread_mutexattr_t;
+procedure TSimpleSharedMemory.InitializeMutex;
 begin
-If pthread_mutexattr_init(@MutexAttr) = 0 then
-  try
-    If pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED) <> 0 then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute pshared (%d).',[errno_ptr^]);
-    If pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE) <> 0 then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute type (%d).',[errno_ptr^]);
-    If pthread_mutex_init(Addr(fHeaderPtr^.Synchronizer),@MutexAttr) <> 0 then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex (%d).',[errno_ptr^]);
-  finally
-    pthread_mutexattr_destroy(@MutexAttr);
-  end
-else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex attributes (%d).',[errno_ptr^]);
+// do nothing
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSharedMemory.TryInitialize: Boolean;
+procedure TSimpleSharedMemory.FinalizeMutex;
+begin
+// do nothing
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleSharedMemory.TryInitialize: Boolean;
 var
   MappingObj: cint;
 begin
@@ -324,7 +375,7 @@ MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
 If MappingObj >= 0 then
   try
     If ftruncate(MappingObj,off_t(fFullSize)) < 0 then
-      raise ESHMSMappingTruncateError.CreateFmt('TSharedMemory.Initialize: Failed to truncate mapping (%d).',[errno_ptr^]);
+      raise ESHMSMappingTruncateError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to truncate mapping (%d).',[errno_ptr^]);
     // map file into memory
     fMemoryBase := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
     If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1){MAP_FAILED}) then
@@ -361,16 +412,16 @@ If MappingObj >= 0 then
           SimpleFutexUnlock(fHeaderPtr^.RefLock);
         end;
       end
-    else raise ESHMSMemoryMappingError.CreateFmt('TSharedMemory.Initialize: Failed to map memory (%d).',[errno_ptr^]);
+    else raise ESHMSMemoryMappingError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to map memory (%d).',[errno_ptr^]);
   finally
     close(MappingObj);
   end
-else raise ESHMSMappingCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mapping (%d).',[errno_ptr^]);
+else raise ESHMSMappingCreationError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to create mapping (%d).',[errno_ptr^]);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSharedMemory.Initialize;
+procedure TSimpleSharedMemory.Initialize;
 begin
 while not TryInitialize do
   sched_yield;
@@ -378,7 +429,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSharedMemory.Finalize;
+procedure TSimpleSharedMemory.Finalize;
 begin
 {
   If there was exception in the constructor, the header pointer might not be
@@ -405,8 +456,8 @@ If Assigned(fHeaderPtr) then
           Set reference counter to -1 to indicate it is being destroyed.
         }
           fHeaderPtr^.RefCount := -1;
-          // destroy mutex (ignore errors)
-          pthread_mutex_destroy(Addr(fHeaderPtr^.Synchronizer));
+          // destroy mutex
+          FinalizeMutex;
           // unlink mapping (ignore errors)
           shm_unlink(PChar(StrToSys(fName)));
         end
@@ -427,7 +478,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-class Function TSharedMemory.RectifyName(const Name: String): String;
+class Function TSimpleSharedMemory.RectifyName(const Name: String): String;
 var
   i:  Integer;
 begin
@@ -452,26 +503,100 @@ end;
 {$ENDIF}
 
 {-------------------------------------------------------------------------------
-    TSharedMemory - public methods
+    TSimpleSharedMemory - public methods
 -------------------------------------------------------------------------------}
 
-constructor TSharedMemory.Create(InitSize: TMemSize; const Name: String);
+constructor TSimpleSharedMemory.Create(InitSize: TMemSize; const Name: String);
 begin
 inherited Create;
 fName := RectifyName(Name);
+If Length(fName) <= 0 then
+  raise ESHMSInvalidValue.Create('TSimpleSharedMemory.Create: Empty name not allowed.');
 fSize := InitSize;
 Initialize;
 end;
 
 //------------------------------------------------------------------------------
 
-destructor TSharedMemory.Destroy;
+destructor TSimpleSharedMemory.Destroy;
 begin
 Finalize;
 inherited;
 end;
 
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 TSharedMemory
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSharedMemory - class declaration
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TSharedMemory - protected methods
+-------------------------------------------------------------------------------}
+
+{$IFDEF Windows}
+
+class Function TSharedMemory.GetMappingPrefix: String;
+begin
+// do not call inherited code
+Result := SHMS_NAME_PREFIX_MAP;
+end;
+
 //------------------------------------------------------------------------------
+
+procedure TSharedMemory.Initialize;
+begin
+// create/open synchronization mutex
+fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(SHMS_NAME_PREFIX_SYNC + fName)));
+If fMappingSync = 0 then
+  raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mutex (0x%.8x).',[GetLastError]);
+inherited;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSharedMemory.Finalize;
+begin
+inherited;
+CloseHandle(fMappingSync);
+end;
+
+{$ELSE}
+//------------------------------------------------------------------------------
+
+procedure TSharedMemory.InitializeMutex;
+var
+  MutexAttr:  pthread_mutexattr_t;
+begin
+If pthread_mutexattr_init(@MutexAttr) = 0 then
+  try
+    If pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED) <> 0 then
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute pshared (%d).',[errno_ptr^]);
+    If pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE) <> 0 then
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute type (%d).',[errno_ptr^]);
+    If pthread_mutex_init(Addr(fHeaderPtr^.Synchronizer),@MutexAttr) <> 0 then
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex (%d).',[errno_ptr^]);
+  finally
+    pthread_mutexattr_destroy(@MutexAttr);
+  end
+else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex attributes (%d).',[errno_ptr^]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSharedMemory.FinalizeMutex;
+begin
+// ignore errors
+pthread_mutex_destroy(Addr(fHeaderPtr^.Synchronizer));
+end;
+
+{$ENDIF}
+
+{-------------------------------------------------------------------------------
+    TSharedMemory - public methods
+-------------------------------------------------------------------------------}
 
 procedure TSharedMemory.Lock;
 begin
@@ -499,40 +624,102 @@ end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                              TSharedMemoryStream                                                             
+                            TSimpleSharedMemoryStream
 --------------------------------------------------------------------------------
 ===============================================================================}
 {===============================================================================
-    TSharedMemoryStream - class implementation
+    TSimpleSharedMemoryStream - class implementation
 ===============================================================================}
 {-------------------------------------------------------------------------------
     TSharedMemoryStream - protected methods
 -------------------------------------------------------------------------------}
 
-Function TSharedMemoryStream.GetName: String;
+Function TSimpleSharedMemoryStream.GetName: String;
 begin
 Result := fSharedMemory.Name;
+end;
+
+//------------------------------------------------------------------------------
+
+class Function TSimpleSharedMemoryStream.GetSharedMemoryInstance(InitSize: TMemSize; const Name: String): TSimpleSharedMemory;
+begin
+Result := TSimpleSharedMemory.Create(InitSize,Name);
 end;
 
 {-------------------------------------------------------------------------------
     TSharedMemoryStream - public methods
 -------------------------------------------------------------------------------}
 
-constructor TSharedMemoryStream.Create(InitSize: TMemSize; const Name: String);
+constructor TSimpleSharedMemoryStream.Create(InitSize: TMemSize; const Name: String);
 var
-  SharedMemory: TSharedMemory;
+  SharedMemory: TSimpleSharedMemory;
 begin
-SharedMemory := TSharedMemory.Create(InitSize,Name);
-inherited Create(SharedMemory.Memory,SharedMemory.Size);
+SharedMemory := GetSharedMemoryInstance(InitSize,Name);
+try
+  inherited Create(SharedMemory.Memory,SharedMemory.Size);
+except
+  // in case inherited constructor fails
+  FreeAndNil(SharedMemory);
+  raise;
+end;
 fSharedMemory := SharedMemory;
 end;
 
 //------------------------------------------------------------------------------
 
-destructor TSharedMemoryStream.Destroy;
+destructor TSimpleSharedMemoryStream.Destroy;
 begin
 FreeAndNil(fSharedMemory);
 inherited;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleSharedMemoryStream.Read(var Buffer; Count: LongInt): LongInt;
+begin
+Result := inherited Read(Buffer,Count);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleSharedMemoryStream.Write(const Buffer; Count: LongInt): LongInt;
+begin
+Result := inherited Write(Buffer,Count);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                              TSharedMemoryStream
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSharedMemoryStream - class declaration
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TSharedMemoryStream - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TSharedMemoryStream.GetSharedMemoryInstance(InitSize: TMemSize; const Name: String): TSimpleSharedMemory;
+begin
+// do not call inherited code
+Result := TSharedMemory.Create(InitSize,Name);
+end;
+
+{-------------------------------------------------------------------------------
+    TSharedMemoryStream - public methods
+-------------------------------------------------------------------------------}
+
+procedure TSharedMemoryStream.Lock;
+begin
+TSharedMemory(fSharedMemory).Lock;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSharedMemoryStream.Unlock;
+begin
+TSharedMemory(fSharedMemory).Unlock;
 end;
 
 //------------------------------------------------------------------------------
@@ -557,20 +744,6 @@ try
 finally
   Unlock;
 end;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TSharedMemoryStream.Lock;
-begin
-fSharedMemory.Lock;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TSharedMemoryStream.Unlock;
-begin
-fSharedMemory.Unlock;
 end;
 
 end.
