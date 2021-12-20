@@ -33,9 +33,9 @@
     In non-simple streams, the methods Read and Write are protected by a lock,
     so it is not necessary to lock the access explicitly.
 
-  Version 1.2 (2021-12-18)
+  Version 1.2.1 (2021-12-20)
 
-  Last change 2021-12-19
+  Last change 2021-12-20
 
   ©2018-2021 František Milt
 
@@ -142,7 +142,7 @@ type
     fSize:        TMemSize;
   {$IFDEF Windows}
     fMappingObj:  THandle;
-    class Function GetMappingPrefix: String; virtual;
+    class Function GetMappingSuffix: String; virtual;
   {$ELSE}
     fMemoryBase:  Pointer;
     fFullSize:    TMemSize;
@@ -175,7 +175,7 @@ type
   protected
   {$IFDEF Windows}
     fMappingSync: THandle;
-    class Function GetMappingPrefix: String; override;
+    class Function GetMappingSuffix: String; override;
     procedure Initialize; override;
     procedure Finalize; override;
   {$ELSE}
@@ -253,8 +253,12 @@ uses
 {$IFDEF Windows}
 
 const
-  SHMS_NAME_PREFIX_MAP  = 'shms_map_';
-  SHMS_NAME_PREFIX_SYNC = 'shms_sync_';
+{
+  Do not change to prefixes! It would interfere with system prefixes added to
+  the name by user.
+}
+  SHMS_NAME_SUFFIX_MAP  = '@shms_map';
+  SHMS_NAME_SUFFIX_SYNC = '@shms_sync';
 
 {$ELSE}
 
@@ -297,7 +301,7 @@ Function shm_unlink(name: pchar): cint; cdecl; external;
 
 {$IFDEF Windows}
 
-class Function TSimpleSharedMemory.GetMappingPrefix: String;
+class Function TSimpleSharedMemory.GetMappingSuffix: String;
 begin
 Result := '';
 end;
@@ -308,7 +312,7 @@ procedure TSimpleSharedMemory.Initialize;
 begin
 // create/open memory mapping
 fMappingObj := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(UInt64(fSize) shr 32),
-                                  DWORD(fSize),PWideChar(StrToWide(GetMappingPrefix + fName)));
+                                  DWORD(fSize),PWideChar(StrToWide(fName + GetMappingSuffix)));
 If fMappingObj = 0 then
   raise ESHMSMappingCreationError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to create mapping (0x%.8x).',[GetLastError]);
 // map memory
@@ -538,10 +542,10 @@ end;
 
 {$IFDEF Windows}
 
-class Function TSharedMemory.GetMappingPrefix: String;
+class Function TSharedMemory.GetMappingSuffix: String;
 begin
 // do not call inherited code
-Result := SHMS_NAME_PREFIX_MAP;
+Result := SHMS_NAME_SUFFIX_MAP;
 end;
 
 //------------------------------------------------------------------------------
@@ -549,7 +553,7 @@ end;
 procedure TSharedMemory.Initialize;
 begin
 // create/open synchronization mutex
-fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(SHMS_NAME_PREFIX_SYNC + fName)));
+fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(fName + SHMS_NAME_SUFFIX_SYNC)));
 If fMappingSync = 0 then
   raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mutex (0x%.8x).',[GetLastError]);
 inherited;
