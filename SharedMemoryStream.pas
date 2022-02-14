@@ -33,11 +33,11 @@
     In non-simple streams, the methods Read and Write are protected by a lock,
     so it is not necessary to lock the access explicitly.
 
-  Version 1.2.1 (2021-12-20)
+  Version 1.2.2 (2022-02-15)
 
-  Last change 2021-12-20
+  Last change 2022-02-15
 
-  ©2018-2021 František Milt
+  ©2018-2022 František Milt
 
   Contacts:
     František Milt: frantisek.milt@gmail.com
@@ -290,6 +290,18 @@ Function pthread_mutex_unlock(mutex: pthread_mutex_p): cint; cdecl; external;
 Function shm_open(name: pchar; oflag: cint; mode: mode_t): cint; cdecl; external;
 Function shm_unlink(name: pchar): cint; cdecl; external;
 
+threadvar
+  ThrErrorCode: cInt;
+
+Function ErrChk(ErrorCode: cInt): Boolean;
+begin
+Result := ErrorCode = 0;
+If Result then
+  ThrErrorCode := 0
+else
+  ThrErrorCode := ErrorCode;
+end;
+
 {$ENDIF}
 
 {===============================================================================
@@ -314,11 +326,11 @@ begin
 fMappingObj := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(UInt64(fSize) shr 32),
                                   DWORD(fSize),PWideChar(StrToWide(fName + GetMappingSuffix)));
 If fMappingObj = 0 then
-  raise ESHMSMappingCreationError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to create mapping (0x%.8x).',[GetLastError]);
+  raise ESHMSMappingCreationError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to create mapping (%d).',[GetLastError]);
 // map memory
 fMemory := MapViewOfFile(fMappingObj,FILE_MAP_ALL_ACCESS,0,0,fSize);
 If not Assigned(fMemory) then
-  raise ESHMSMemoryMappingError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to map memory (0x%.8x).',[GetLastError]);
+  raise ESHMSMemoryMappingError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to map memory (%d).',[GetLastError]);
 end;
 
 //------------------------------------------------------------------------------
@@ -555,7 +567,7 @@ begin
 // create/open synchronization mutex
 fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(fName + SHMS_NAME_SUFFIX_SYNC)));
 If fMappingSync = 0 then
-  raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mutex (0x%.8x).',[GetLastError]);
+  raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mutex (%d).',[GetLastError]);
 inherited;
 end;
 
@@ -574,18 +586,18 @@ procedure TSharedMemory.InitializeMutex;
 var
   MutexAttr:  pthread_mutexattr_t;
 begin
-If pthread_mutexattr_init(@MutexAttr) = 0 then
+If ErrChk(pthread_mutexattr_init(@MutexAttr)) then
   try
-    If pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED) <> 0 then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute pshared (%d).',[errno_ptr^]);
-    If pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE) <> 0 then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute type (%d).',[errno_ptr^]);
-    If pthread_mutex_init(Addr(fHeaderPtr^.Synchronizer),@MutexAttr) <> 0 then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex (%d).',[errno_ptr^]);
+    If not ErrChk(pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED)) then
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute pshared (%d).',[ThrErrorCode]);
+    If not ErrChk(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute type (%d).',[ThrErrorCode]);
+    If not ErrChk(pthread_mutex_init(Addr(fHeaderPtr^.Synchronizer),@MutexAttr)) then
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex (%d).',[ThrErrorCode]);
   finally
     pthread_mutexattr_destroy(@MutexAttr);
   end
-else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex attributes (%d).',[errno_ptr^]);
+else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex attributes (%d).',[ThrErrorCode]);
 end;
 
 //------------------------------------------------------------------------------
@@ -606,10 +618,10 @@ procedure TSharedMemory.Lock;
 begin
 {$IFDEF Windows}
 If not(WaitForSingleObject(fMappingSync,INFINITE) in [WAIT_ABANDONED,WAIT_OBJECT_0]) then
-  raise ESHMSLockError.Create('TSharedMemory.Lock: Failed to lock.');  ;
+  raise ESHMSLockError.Create('TSharedMemory.Lock: Failed to lock.');
 {$ELSE}
-If pthread_mutex_lock(Addr(fHeaderPtr^.Synchronizer)) <> 0 then
-  raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[errno_ptr^]);
+If not ErrChk(pthread_mutex_lock(Addr(fHeaderPtr^.Synchronizer))) then
+  raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[ThrErrorCode]);
 {$ENDIF}
 end;
 
@@ -618,10 +630,11 @@ end;
 procedure TSharedMemory.Unlock;
 begin
 {$IFDEF Windows}
-ReleaseMutex(fMappingSync);
+If not ReleaseMutex(fMappingSync) then
+  raise ESHMSUnlockError.CreateFmt('TSharedMemory.Unlock: Failed to unlock (%d).',[GetLastError]);
 {$ELSE}
-If pthread_mutex_unlock(Addr(fHeaderPtr^.Synchronizer)) <> 0 then
-  raise ESHMSUnlockError.CreateFmt('TSharedMemory.Lock: Failed to unlock (%d).',[errno_ptr^]);
+If not ErrChk(pthread_mutex_unlock(Addr(fHeaderPtr^.Synchronizer))) then
+  raise ESHMSUnlockError.CreateFmt('TSharedMemory.Unlock: Failed to unlock (%d).',[ThrErrorCode]);
 {$ENDIF}
 end;
 
