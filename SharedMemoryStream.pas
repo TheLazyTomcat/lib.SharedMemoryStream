@@ -33,9 +33,9 @@
     In non-simple streams, the methods Read and Write are protected by a lock,
     so it is not necessary to lock the access explicitly.
 
-  Version 1.2.2 (2022-02-15)
+  Version 1.2.3 (2022-03-04)
 
-  Last change 2022-02-15
+  Last change 2022-03-04
 
   ©2018-2022 František Milt
 
@@ -256,9 +256,17 @@ const
 {
   Do not change to prefixes! It would interfere with system prefixes added to
   the name by user.
+
+  Both suffixes MUST be the same length.
 }
-  SHMS_NAME_SUFFIX_MAP  = '@shms_map';
+  SHMS_NAME_SUFFIX_SECT = '@shms_sect'; // section :P
   SHMS_NAME_SUFFIX_SYNC = '@shms_sync';
+
+  SHMS_NAME_SUFFIX_LEN = Length(SHMS_NAME_SUFFIX_SECT);
+
+{$IF not Declared(UNICODE_STRING_MAX_CHARS)}
+  UNICODE_STRING_MAX_CHARS = 32767;
+{$IFEND}
 
 {$ELSE}
 
@@ -348,11 +356,13 @@ var
   i,Cnt:  Integer;
 begin
 {
-  There can be exactly one backslash (separating namespace prefix).
-  Replace other backslashes by underscores and convert to lower case. Do not
-  limit length.
+  Convert to lower case and limit the length while accounting for suffixes.
+  There can be exactly one backslash (separating namespace prefix), replace
+  other backslashes by underscores.
 }
 Result := AnsiLowerCase(Name);
+If (Length(Result) + SHMS_NAME_SUFFIX_LEN) > UNICODE_STRING_MAX_CHARS then
+  SetLength(Result,UNICODE_STRING_MAX_CHARS - SHMS_NAME_SUFFIX_LEN);
 Cnt := 0;
 For i := 1 to Length(Result) do
   If Result[i] = '\' then
@@ -557,7 +567,7 @@ end;
 class Function TSharedMemory.GetMappingSuffix: String;
 begin
 // do not call inherited code
-Result := SHMS_NAME_SUFFIX_MAP;
+Result := SHMS_NAME_SUFFIX_SECT;
 end;
 
 //------------------------------------------------------------------------------
