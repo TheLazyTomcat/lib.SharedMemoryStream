@@ -33,9 +33,9 @@
     In non-simple streams, the methods Read and Write are protected by a lock,
     so it is not necessary to lock the access explicitly.
 
-  Version 1.2.3 (2022-03-04)
+  Version 1.2.4 (2022-06-06)
 
-  Last change 2022-03-04
+  Last change 2022-06-06
 
   ©2018-2022 František Milt
 
@@ -410,7 +410,7 @@ If MappingObj >= 0 then
       {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
         fMemory := Pointer(PtrUInt(fMemoryBase) + (PtrUInt(SizeOf(TSharedMemoryHeader) + 127) and not PtrUInt(127)));
       {$IFDEF FPCDWM}{$POP}{$ENDIF}
-        SimpleFutexLock(fHeaderPtr^.RefLock);
+        SimpleMutexLock(fHeaderPtr^.RefLock);
         try
           If fHeaderPtr^.RefCount = 0 then
             begin
@@ -435,7 +435,7 @@ If MappingObj >= 0 then
         }
           else munmap(fMemoryBase,size_t(fFullSize));
         finally
-          SimpleFutexUnlock(fHeaderPtr^.RefLock);
+          SimpleMutexUnlock(fHeaderPtr^.RefLock);
         end;
       end
     else raise ESHMSMemoryMappingError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to map memory (%d).',[errno_ptr^]);
@@ -463,7 +463,7 @@ begin
 }
 If Assigned(fHeaderPtr) then
   begin
-    SimpleFutexLock(fHeaderPtr^.RefLock);
+    SimpleMutexLock(fHeaderPtr^.RefLock);
     try
       If fHeaderPtr^.RefCount = 0 then
         begin
@@ -494,7 +494,7 @@ If Assigned(fHeaderPtr) then
         so do nothing.
       }
     finally
-      SimpleFutexUnlock(fHeaderPtr^.RefLock);
+      SimpleMutexUnlock(fHeaderPtr^.RefLock);
     end;
   end;
 // unmapping is done in any case...
