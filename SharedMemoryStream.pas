@@ -25,7 +25,7 @@
     locking is not needed or is implemented by external means.
 
       NOTE - in Windows OS for non-simple classes, the name of mapping is
-             prefixed and is therefore not exactly the same as the name given
+             suffixed and is therefore not exactly the same as the name given
              in creation. This is done because the same name is used for named
              mutex used in locking, but Windows do not allow two different
              objects to have the same name.
@@ -35,7 +35,7 @@
 
   Version 1.2.4 (2022-06-06)
 
-  Last change 2022-06-06
+  Last change 2022-06-14
 
   ©2018-2022 František Milt
 
