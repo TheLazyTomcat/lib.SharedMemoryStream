@@ -33,11 +33,11 @@
     In non-simple streams, the methods Read and Write are protected by a lock,
     so it is not necessary to lock the access explicitly.
 
-  Version 1.2.4 (2022-06-06)
+  Version 1.2.5 (2024-05-03)
 
-  Last change 2022-06-14
+  Last change 2024-05-03
 
-  ©2018-2022 František Milt
+  ©2018-2024 František Milt
 
   Contacts:
     František Milt: frantisek.milt@gmail.com
@@ -54,22 +54,43 @@
       github.com/TheLazyTomcat/Lib.SharedMemoryStream
 
   Dependencies:
-    AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
     AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
+  * AuxExceptions      - github.com/TheLazyTomcat/Lib.AuxExceptions
+    AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
+  * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex
     StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
     StrRect            - github.com/TheLazyTomcat/Lib.StrRect
-  * SimpleCPUID        - github.com/TheLazyTomcat/Lib.SimpleCPUID
-  * InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
-  * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex
 
-  Libraries SimpleFutex, InterlockedOps and SimpleCPUID are required only when
-  compiling for Linux operating system.
+  Library AuxExceptions is required only when rebasing local exception classes
+  (see symbol SharedMemoryStream_UseAuxExceptions for details).
 
-  SimpleCPUID might not be required, depending on defined symbols in library
-  InterlockedOps.
+  Library SimpleFutex is required only when compiling for Linux operating
+  system.
+
+  Library AuxExceptions might also be required as an indirect dependency.
+
+  Indirect dependencies:
+    AuxMath        - github.com/TheLazyTomcat/Lib.AuxMath
+    InterlockedOps - github.com/TheLazyTomcat/Lib.InterlockedOps
+    SimpleCPUID    - github.com/TheLazyTomcat/Lib.SimpleCPUID
+    UInt64Utils    - github.com/TheLazyTomcat/Lib.UInt64Utils
+    WinFileInfo    - github.com/TheLazyTomcat/Lib.WinFileInfo
 
 ===============================================================================}
 unit SharedMemoryStream;
+{
+  SharedMemoryStream_UseAuxExceptions
+
+  If you want library-specific exceptions to be based on more advanced classes
+  provided by AuxExceptions library instead of basic Exception class, and don't
+  want to or cannot change code in this unit, you can define global symbol
+  SharedMemoryStream_UseAuxExceptions to achieve this.
+}
+{$IF Defined(SharedMemoryStream_UseAuxExceptions)}
+  {$DEFINE UseAuxExceptions}
+{$IFEND}
+
+//------------------------------------------------------------------------------
 
 {$IF defined(CPU64) or defined(CPU64BITS)}
   {$DEFINE CPU64bit}
@@ -99,13 +120,14 @@ interface
 
 uses
   SysUtils, Classes, {$IFDEF Linux}baseunix,{$ENDIF}
-  AuxTypes, AuxClasses, StaticMemoryStream{$IFDEF Linux}, SimpleFutex{$ENDIF};
+  AuxTypes, AuxClasses, StaticMemoryStream{$IFDEF Linux}, SimpleFutex{$ENDIF}
+  {$IFDEF UseAuxExceptions}, AuxExceptions{$ENDIF};
 
 {===============================================================================
     Library-specific exceptions
 ===============================================================================}
 type
-  ESHMSException = class(Exception);
+  ESHMSException = class({$IFDEF UseAuxExceptions}EAEGeneralException{$ELSE}Exception{$ENDIF});
 
   ESHMSInvalidValue         = class(ESHMSException);
   ESHMSMutexCreationError   = class(ESHMSException);
