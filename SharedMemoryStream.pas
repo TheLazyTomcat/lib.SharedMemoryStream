@@ -21,21 +21,37 @@
     them.
     Classes with "simple" in name do not provide any locking, others can be
     locked (methods Lock and Unlock) to prevent data corruption (internally
-    implemented via mutex). Simple classes are provided for situations where
+    implemented using mutex). Simple classes are provided for situations where
     locking is not needed or is implemented by external means.
 
-      NOTE - in Windows OS for non-simple classes, the name of mapping is
-             suffixed and is therefore not exactly the same as the name given
-             in creation. This is done because the same name is used for named
+      NOTE - For non-simple classes, the name of mapping is suffixed and is
+             therefore not exactly the same as the name given in creation.
+
+             In Windows, this is done because the same name is used for named
              mutex used in locking, but Windows do not allow two different
              objects to have the same name.
+
+             In Linux, this is to separate mappings created by 32bit programs
+             from mappings created by 64bit programs - the mutex used for
+             locking is different in both mentioned flavors of Linux, therefore
+             such mappings are completely incompatible.
+             Simple mappings do not use the internal mutex, so they are
+             compatible and mutually visible.
 
     In non-simple streams, the methods Read and Write are protected by a lock,
     so it is not necessary to lock the access explicitly.
 
-  Version 1.2.5 (2024-05-03)
+      WARNING - current implementation is not compatible with versions older
+                than 1.3, they might work together, but in such case you will
+                eventually run into serious problems.
 
-  Last change 2024-05-03
+      WARNING - the mappings in Linux are NOT robust. If program or thread ends
+                without fully freeing its mapping object, the internal data
+                will become incosistent.
+
+  Version 1.3 (2024-05-16)
+
+  Last change 2024-05-16
 
   ©2018-2024 František Milt
 
@@ -57,6 +73,7 @@
     AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
   * AuxExceptions      - github.com/TheLazyTomcat/Lib.AuxExceptions
     AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
+  * InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
   * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex
     StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
     StrRect            - github.com/TheLazyTomcat/Lib.StrRect
@@ -64,17 +81,17 @@
   Library AuxExceptions is required only when rebasing local exception classes
   (see symbol SharedMemoryStream_UseAuxExceptions for details).
 
-  Library SimpleFutex is required only when compiling for Linux operating
-  system.
+  Libraries InterlockedOps and SimpleFutex are required only when compiling for
+  Linux operating system.
 
-  Library AuxExceptions might also be required as an indirect dependency.
+  Libraries AuxExceptions and InterlockedOps might also be required as an
+  indirect dependencies.
 
   Indirect dependencies:
-    AuxMath        - github.com/TheLazyTomcat/Lib.AuxMath
-    InterlockedOps - github.com/TheLazyTomcat/Lib.InterlockedOps
-    SimpleCPUID    - github.com/TheLazyTomcat/Lib.SimpleCPUID
-    UInt64Utils    - github.com/TheLazyTomcat/Lib.UInt64Utils
-    WinFileInfo    - github.com/TheLazyTomcat/Lib.WinFileInfo
+    AuxMath     - github.com/TheLazyTomcat/Lib.AuxMath
+    SimpleCPUID - github.com/TheLazyTomcat/Lib.SimpleCPUID
+    UInt64Utils - github.com/TheLazyTomcat/Lib.UInt64Utils
+    WinFileInfo - github.com/TheLazyTomcat/Lib.WinFileInfo
 
 ===============================================================================}
 unit SharedMemoryStream;
@@ -146,11 +163,29 @@ type
 {$IFDEF Linux}
 type
   TSharedMemoryHeader = record
-    RefLock:      TFutex;
-    RefCount:     Int32;
-    Synchronizer: pthread_mutex_t;
+    RefLock:            TFutex;
+    RefCount:           Int32;
+    case Integer of
+      0: (Synchronizer:       pthread_mutex_t);
+      1: (SyncPad:            array[0..63] of Byte;
+        {
+          As map is initialized to all zero, MayBeInconsistent is initialy
+          false.
+
+          Repair is currently not implemented (only Synchronizer mutex is
+          robust).
+        }
+          MayBeInconsistent:  ByteBool;
+        {
+          Signature is used to check whether the mapping is compatible with
+          current implementation.
+        }
+          Signature:          UInt32);
   end;
   PSharedMemoryHeader = ^TSharedMemoryHeader;
+
+const
+  SMS_MAPHEADER_SIGNATURE = $FF000001;
 {$ENDIF}
 
 {===============================================================================
@@ -164,7 +199,6 @@ type
     fSize:        TMemSize;
   {$IFDEF Windows}
     fMappingObj:  THandle;
-    class Function GetMappingSuffix: String; virtual;
   {$ELSE}
     fMemoryBase:  Pointer;
     fFullSize:    TMemSize;
@@ -176,6 +210,7 @@ type
     procedure Initialize; virtual;
     procedure Finalize; virtual;
     class Function RectifyName(const Name: String): String; virtual;
+    class Function GetMappingSuffix: String; virtual;
   public
     constructor Create(InitSize: TMemSize; const Name: String);
     destructor Destroy; override;
@@ -197,13 +232,13 @@ type
   protected
   {$IFDEF Windows}
     fMappingSync: THandle;
-    class Function GetMappingSuffix: String; override;
     procedure Initialize; override;
     procedure Finalize; override;
   {$ELSE}
     procedure InitializeMutex; override;
     procedure FinalizeMutex; override;
   {$ENDIF}
+    class Function GetMappingSuffix: String; override;
   public
     procedure Lock; virtual;
     procedure Unlock; virtual;
@@ -254,7 +289,7 @@ implementation
 
 uses
   {$IFDEF Windows}Windows,{$ELSE}unixtype, StrUtils,{$ENDIF}
-  StrRect;
+  {$IFNDEF Windows}InterlockedOps,{$ENDIF} StrRect;
 
 {$IFDEF Linux}
   {$LINKLIB libc}
@@ -292,6 +327,11 @@ const
 
 {$ELSE}
 
+const
+  SHMS_NAME_SUFFIX = {$IFDEF CPU64bit}'_64'{$ELSE}'_32'{$ENDIF};
+
+  SHMS_NAME_SUFFIX_LEN = Length(SHMS_NAME_SUFFIX);
+
 Function errno_ptr: pcint; cdecl; external name '__errno_location';
 Function sched_yield: cint; cdecl; external;
 Function close(fd: cint): cint; cdecl; external;
@@ -306,16 +346,19 @@ type
 const
   PTHREAD_PROCESS_SHARED  = 1;
   PTHREAD_MUTEX_RECURSIVE = 1;
+  PTHREAD_MUTEX_ROBUST    = 1;
 
 Function pthread_mutexattr_init(attr: pthread_mutexattr_p): cint; cdecl; external;
 Function pthread_mutexattr_destroy(attr: pthread_mutexattr_p): cint; cdecl; external;
 Function pthread_mutexattr_setpshared(attr: pthread_mutexattr_p; pshared: cint): cint; cdecl; external;
 Function pthread_mutexattr_settype(attr: pthread_mutexattr_p; _type: cint): cint; cdecl; external;
+Function pthread_mutexattr_setrobust(attr: pthread_mutexattr_p; robustness: cint): cint; cdecl; external;
 
 Function pthread_mutex_init(mutex: pthread_mutex_p; attr: pthread_mutexattr_p): cint; cdecl; external;
 Function pthread_mutex_destroy(mutex: pthread_mutex_p): cint; cdecl; external;
 Function pthread_mutex_lock(mutex: pthread_mutex_p): cint; cdecl; external;
 Function pthread_mutex_unlock(mutex: pthread_mutex_p): cint; cdecl; external;
+Function pthread_mutex_consistent(mutex: pthread_mutex_p): cint; cdecl; external;
 
 Function shm_open(name: pchar; oflag: cint; mode: mode_t): cint; cdecl; external;
 Function shm_unlink(name: pchar): cint; cdecl; external;
@@ -342,13 +385,6 @@ end;
 -------------------------------------------------------------------------------}
 
 {$IFDEF Windows}
-
-class Function TSimpleSharedMemory.GetMappingSuffix: String;
-begin
-Result := '';
-end;
-
-//------------------------------------------------------------------------------
 
 procedure TSimpleSharedMemory.Initialize;
 begin
@@ -413,19 +449,23 @@ end;
 
 Function TSimpleSharedMemory.TryInitialize: Boolean;
 var
-  MappingObj: cint;
+  MappingObj:     cint;
+  OrigSignature:  UInt32;
 begin
 Result := False;
 // add space for header
 fFullSize := (TMemSize(SizeOf(TSharedMemoryHeader) + 127) and not TMemSize(127)) + fSize;
 // create/open mapping
-MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
+MappingObj := shm_open(PChar(StrToSys(fName + GetMappingSuffix)),O_CREAT or O_RDWR,S_IRWXU);
 If MappingObj >= 0 then
   try
     If ftruncate(MappingObj,off_t(fFullSize)) < 0 then
       raise ESHMSMappingTruncateError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to truncate mapping (%d).',[errno_ptr^]);
     // map file into memory
     fMemoryBase := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
+    OrigSignature := InterlockedOps.InterlockedCompareExchange(PSharedMemoryHeader(fMemoryBase)^.Signature,SMS_MAPHEADER_SIGNATURE,0);
+    If (OrigSignature <> SMS_MAPHEADER_SIGNATURE) and (OrigSignature <> 0{initial state}) then
+      raise ESHMSMemoryMappingError.Create('TSimpleSharedMemory.Initialize: Unsupported mapping.');
     If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1){MAP_FAILED}) then
       begin
         fHeaderPtr := fMemoryBase;
@@ -495,7 +535,7 @@ If Assigned(fHeaderPtr) then
           Unlink the mapping but do not destroy mutex (it should not exist).
         }
           fHeaderPtr^.RefCount := -1;
-          shm_unlink(PChar(StrToSys(fName)));
+          shm_unlink(PChar(StrToSys(fName + GetMappingSuffix)));
         end
       else If fHeaderPtr^.RefCount = 1 then
         begin
@@ -507,7 +547,7 @@ If Assigned(fHeaderPtr) then
           // destroy mutex
           FinalizeMutex;
           // unlink mapping (ignore errors)
-          shm_unlink(PChar(StrToSys(fName)));
+          shm_unlink(PChar(StrToSys(fName + GetMappingSuffix)));
         end
       else If fHeaderPtr^.RefCount > 1 then
         Dec(fHeaderPtr^.RefCount);
@@ -535,20 +575,27 @@ begin
   slashes.
   Check if there is leading slash and add it when isn't, replace other slashes
   with underscores and convert to lower case. Also limit the length to NAME_MAX
-  characters.
+  characters (including suffix).
 }
 If not AnsiStartsText('/',Name) then
   Result := AnsiLowerCase('/' + Name)
 else
   Result := AnsiLowerCase(Name);
-If Length(Result) > NAME_MAX then
-  SetLength(Result,NAME_MAX);
+If Length(Result) + SHMS_NAME_SUFFIX_LEN > NAME_MAX then
+  SetLength(Result,NAME_MAX - SHMS_NAME_SUFFIX_LEN);
 For i := 2 to Length(Result) do
   If Result[i] = '/' then
     Result[i] := '_';
 end;
 
 {$ENDIF}
+
+//------------------------------------------------------------------------------
+
+class Function TSimpleSharedMemory.GetMappingSuffix: String;
+begin
+Result := '';
+end;
 
 {-------------------------------------------------------------------------------
     TSimpleSharedMemory - public methods
@@ -586,14 +633,6 @@ end;
 
 {$IFDEF Windows}
 
-class Function TSharedMemory.GetMappingSuffix: String;
-begin
-// do not call inherited code
-Result := SHMS_NAME_SUFFIX_SECT;
-end;
-
-//------------------------------------------------------------------------------
-
 procedure TSharedMemory.Initialize;
 begin
 // create/open synchronization mutex
@@ -618,18 +657,24 @@ procedure TSharedMemory.InitializeMutex;
 var
   MutexAttr:  pthread_mutexattr_t;
 begin
+{$IF SizeOf(pthread_mutex_t) <= 64}
 If ErrChk(pthread_mutexattr_init(@MutexAttr)) then
   try
     If not ErrChk(pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED)) then
       raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute pshared (%d).',[ThrErrorCode]);
     If not ErrChk(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
       raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute type (%d).',[ThrErrorCode]);
+    If not ErrChk(pthread_mutexattr_setrobust(@MutexAttr,PTHREAD_MUTEX_ROBUST)) then
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute robust (%d).',[ThrErrorCode]);
     If not ErrChk(pthread_mutex_init(Addr(fHeaderPtr^.Synchronizer),@MutexAttr)) then
       raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex (%d).',[ThrErrorCode]);
   finally
     pthread_mutexattr_destroy(@MutexAttr);
   end
 else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex attributes (%d).',[ThrErrorCode]);
+{$ELSE}
+  {$MESSAGE FATAL 'Insupported mutex implementation.'}
+{$IFEND}
 end;
 
 //------------------------------------------------------------------------------
@@ -642,20 +687,51 @@ end;
 
 {$ENDIF}
 
+//------------------------------------------------------------------------------
+
+class Function TSharedMemory.GetMappingSuffix: String;
+begin
+// do not call inherited code
+Result := {$IFDEF Windows}SHMS_NAME_SUFFIX_SECT{$ELSE}SHMS_NAME_SUFFIX{$ENDIF};
+end;
+
 {-------------------------------------------------------------------------------
     TSharedMemory - public methods
 -------------------------------------------------------------------------------}
 
 procedure TSharedMemory.Lock;
-begin
 {$IFDEF Windows}
+begin
 If not(WaitForSingleObject(fMappingSync,INFINITE) in [WAIT_ABANDONED,WAIT_OBJECT_0]) then
   raise ESHMSLockError.Create('TSharedMemory.Lock: Failed to lock.');
-{$ELSE}
-If not ErrChk(pthread_mutex_lock(Addr(fHeaderPtr^.Synchronizer))) then
-  raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[ThrErrorCode]);
-{$ENDIF}
 end;
+{$ELSE}
+var
+  ReturnValue:  cint;
+begin
+ReturnValue := pthread_mutex_lock(Addr(fHeaderPtr^.Synchronizer));
+If ReturnValue = ESysEOWNERDEAD then
+  begin
+   {
+    Owner of the mutex died, which also means it most probably have not
+    properly released the mapping - for now mark it inconsistent,
+    implementation of correction will hopefully come later :/.
+   }
+    SimpleMutexLock(fHeaderPtr^.RefLock);
+    try
+      fHeaderPtr^.MayBeInconsistent := True;
+      // implement some rectification...
+    finally
+      SimpleMutexUnlock(fHeaderPtr^.RefLock);
+    end;
+    // mutex is now owned by the calling thread, but must be made consistent to use it again
+    If not ErrChk(pthread_mutex_consistent(Addr(fHeaderPtr^.Synchronizer))) then
+      raise ESHMSLockError.CreateFmt('TMutex.LockStrict: Failed to make mutex consistent (%d).',[ThrErrorCode]);
+  end
+else If not ErrChk(ReturnValue) then
+  raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[ThrErrorCode]);
+end;
+{$ENDIF}
 
 //------------------------------------------------------------------------------
 
