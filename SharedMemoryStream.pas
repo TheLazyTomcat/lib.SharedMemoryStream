@@ -33,7 +33,7 @@
     In non-simple streams, the methods Read and Write are protected by a lock,
     so it is not necessary to lock the access explicitly.
 
-  Version 1.2.5 (2024-05-03)
+  Version 1.2.6 (2024-05-03)
 
   Last change 2024-05-03
 
@@ -306,16 +306,19 @@ type
 const
   PTHREAD_PROCESS_SHARED  = 1;
   PTHREAD_MUTEX_RECURSIVE = 1;
+  PTHREAD_MUTEX_ROBUST    = 1;
 
 Function pthread_mutexattr_init(attr: pthread_mutexattr_p): cint; cdecl; external;
 Function pthread_mutexattr_destroy(attr: pthread_mutexattr_p): cint; cdecl; external;
 Function pthread_mutexattr_setpshared(attr: pthread_mutexattr_p; pshared: cint): cint; cdecl; external;
 Function pthread_mutexattr_settype(attr: pthread_mutexattr_p; _type: cint): cint; cdecl; external;
+Function pthread_mutexattr_setrobust(attr: pthread_mutexattr_p; robustness: cint): cint; cdecl; external;
 
 Function pthread_mutex_init(mutex: pthread_mutex_p; attr: pthread_mutexattr_p): cint; cdecl; external;
 Function pthread_mutex_destroy(mutex: pthread_mutex_p): cint; cdecl; external;
 Function pthread_mutex_lock(mutex: pthread_mutex_p): cint; cdecl; external;
 Function pthread_mutex_unlock(mutex: pthread_mutex_p): cint; cdecl; external;
+Function pthread_mutex_consistent(mutex: pthread_mutex_p): cint; cdecl; external;
 
 Function shm_open(name: pchar; oflag: cint; mode: mode_t): cint; cdecl; external;
 Function shm_unlink(name: pchar): cint; cdecl; external;
@@ -624,6 +627,8 @@ If ErrChk(pthread_mutexattr_init(@MutexAttr)) then
       raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute pshared (%d).',[ThrErrorCode]);
     If not ErrChk(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
       raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute type (%d).',[ThrErrorCode]);
+    If not ErrChk(pthread_mutexattr_setrobust(@MutexAttr,PTHREAD_MUTEX_ROBUST)) then
+      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute robust (%d).',[ThrErrorCode]);
     If not ErrChk(pthread_mutex_init(Addr(fHeaderPtr^.Synchronizer),@MutexAttr)) then
       raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex (%d).',[ThrErrorCode]);
   finally
@@ -647,15 +652,29 @@ end;
 -------------------------------------------------------------------------------}
 
 procedure TSharedMemory.Lock;
-begin
 {$IFDEF Windows}
+begin
 If not(WaitForSingleObject(fMappingSync,INFINITE) in [WAIT_ABANDONED,WAIT_OBJECT_0]) then
   raise ESHMSLockError.Create('TSharedMemory.Lock: Failed to lock.');
-{$ELSE}
-If not ErrChk(pthread_mutex_lock(Addr(fHeaderPtr^.Synchronizer))) then
-  raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[ThrErrorCode]);
-{$ENDIF}
 end;
+{$ELSE}
+var
+  ReturnValue:  cint;
+begin
+ReturnValue := pthread_mutex_lock(Addr(fHeaderPtr^.Synchronizer));
+If ReturnValue = ESysEOWNERDEAD then
+  begin
+  {
+    Owner of the mutex died, it is now owned by the calling thread, but must
+    be made consistent to use it again.
+  }
+    If not ErrChk(pthread_mutex_consistent(Addr(fHeaderPtr^.Synchronizer))) then
+      raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to make mutex consistent (%d).',[ThrErrorCode]);
+  end
+else If not ErrChk(ReturnValue) then
+  raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[ThrErrorCode]);
+end;
+{$ENDIF}
 
 //------------------------------------------------------------------------------
 
@@ -796,4 +815,3 @@ end;
 end;
 
 end.
-
