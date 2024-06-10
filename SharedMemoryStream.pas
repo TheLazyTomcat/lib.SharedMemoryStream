@@ -253,7 +253,7 @@ type
 implementation
 
 uses
-  {$IFDEF Windows}Windows,{$ELSE}unixtype, StrUtils,{$ENDIF}
+  {$IFDEF Windows}Windows,{$ELSE}SyncObjs, Contnrs, unixtype, StrUtils,{$ENDIF}
   StrRect;
 
 {$IFDEF Linux}
@@ -320,9 +320,24 @@ Function pthread_mutex_lock(mutex: pthread_mutex_p): cint; cdecl; external;
 Function pthread_mutex_unlock(mutex: pthread_mutex_p): cint; cdecl; external;
 Function pthread_mutex_consistent(mutex: pthread_mutex_p): cint; cdecl; external;
 
+type
+  pthread_cleanup_routine_t = procedure(arg: Pointer); cdecl;
+
+  pthread_cleanup_buffer_p = ^pthread_cleanup_buffer_t;
+  pthread_cleanup_buffer_t = record
+    routine:    pthread_cleanup_routine_t;    // Function to call
+    arg:        Pointer;                      // Its argument
+    canceltype: cint;                         // Saved cancellation type
+    prev:       pthread_cleanup_buffer_p;     // Chaining of cleanup functions
+  end;
+
+Function pthread_cleanup_push(buffer: pthread_cleanup_buffer_p; routine: pthread_cleanup_routine_t; arg: Pointer): cint; cdecl; external name '_pthread_cleanup_push';
+Function pthread_cleanup_pop(buffer: pthread_cleanup_buffer_p; execute: cint): cint; cdecl; external name '_pthread_cleanup_pop';
+
 Function shm_open(name: pchar; oflag: cint; mode: mode_t): cint; cdecl; external;
 Function shm_unlink(name: pchar): cint; cdecl; external;
 
+//------------------------------------------------------------------------------
 threadvar
   ThrErrorCode: cInt;
 
@@ -333,6 +348,92 @@ If Result then
   ThrErrorCode := 0
 else
   ThrErrorCode := ErrorCode;
+end;
+
+{$ENDIF}
+
+{===============================================================================
+    TSimpleSharedMemory - cleanup management
+===============================================================================}
+{
+  Following code is here to automatically free instances of shared memory
+  objects that are still unfreed at the program termination.
+
+  In Windows, these dangling instances pose no problem, because system
+  automatically closes all handles when the process exits. But in Linux,
+  we manage reference count internally, and any instance that is not freed
+  explicitly would leave that count in inconsistent state.
+  That being said, this cleanup code is included only in Linux builds as it is
+  not needed in Windows OS.
+
+  But note that this protects only when the process exits normally, not when it
+  is killed or crashes (I am currently looking for ways to handle those cases
+  too...).
+}
+{$IFNDEF Windows}
+var
+  InstancesSync:  TCriticalSection = nil;
+  Instances:      TObjectList = nil;
+
+//------------------------------------------------------------------------------
+
+procedure CleanupUnitInitialize;
+begin
+InstancesSync := TCriticalSection.Create;
+Instances := TObjectList.Create(True);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure CleanupUnitFinalize;
+begin
+FreeAndNil(Instances);
+FreeAndNil(InstancesSync);
+end;
+
+//==============================================================================
+
+procedure CleanupLeaveSection(Section: Pointer); cdecl;
+begin
+If Assigned(Section) then
+  TCriticalSection(Section).Leave;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure CleanupInstanceAdd(Instance: TObject);
+var
+  CleanupBuffer:  pthread_cleanup_buffer_t;
+begin
+If Assigned(InstancesSync) and Assigned(Instances) then
+  begin
+    pthread_cleanup_push(@CleanupBuffer,@CleanupLeaveSection,Pointer(InstancesSync));
+    InstancesSync.Enter;
+    try
+      Instances.Add(Instance);
+    finally
+      pthread_cleanup_pop(@CleanupBuffer,1);
+    end;
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure CleanupInstanceRemove(Instance: TObject);
+var
+  CleanupBuffer:  pthread_cleanup_buffer_t;
+begin
+If Assigned(InstancesSync) and Assigned(Instances) then
+  begin
+    pthread_cleanup_push(@CleanupBuffer,@CleanupLeaveSection,Pointer(InstancesSync));
+    InstancesSync.Enter;
+    try
+      // do not call Remove, as that would free the object
+      Instances.Extract(Instance);
+    finally
+      pthread_cleanup_pop(@CleanupBuffer,1);
+    end;
+  end;
 end;
 
 {$ENDIF}
@@ -474,6 +575,7 @@ end;
 
 procedure TSimpleSharedMemory.Initialize;
 begin
+CleanupInstanceAdd(Self);
 while not TryInitialize do
   sched_yield;
 end;
@@ -525,6 +627,7 @@ If Assigned(fHeaderPtr) then
 // unmapping is done in any case...
 If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1)) then
   munmap(fMemoryBase,size_t(fFullSize));
+CleanupInstanceRemove(Self);
 end;
 
 //------------------------------------------------------------------------------
@@ -813,5 +916,19 @@ finally
   Unlock;
 end;
 end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 Unit init/final
+--------------------------------------------------------------------------------
+===============================================================================}
+{$IFNDEF Windows}
+initialization
+  CleanupUnitInitialize;
+
+finalization
+  CleanupUnitFinalize;
+{$ENDIF}
 
 end.
