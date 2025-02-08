@@ -118,7 +118,7 @@ unit SharedMemoryStream;
 interface
 
 uses
-  SysUtils, Classes, {$IFDEF Linux}baseunix,{$ENDIF}
+  SysUtils, Classes, {$IFDEF Linux}BaseUnix,{$ENDIF}
   AuxTypes, AuxClasses, StaticMemoryStream{$IFDEF Linux}, SimpleFutex{$ENDIF}
   {$IFDEF UseAuxExceptions}, AuxExceptions{$ENDIF};
 
@@ -131,8 +131,11 @@ type
   ESHMSInvalidValue         = class(ESHMSException);
   ESHMSMutexCreationError   = class(ESHMSException);
   ESHMSMappingCreationError = class(ESHMSException);
-  ESHMSMappingTruncateError = class(ESHMSException);  // linux only
   ESHMSMemoryMappingError   = class(ESHMSException);
+
+  // following two exceptions can only be raised in linux, but are declared everywhere
+  ESHMSMappingTruncateError = class(ESHMSException);
+  ESHMSMappingIncompatible  = class(ESHMSException);
 
   ESHMSLockError   = class(ESHMSException);
   ESHMSUnlockError = class(ESHMSException);
@@ -142,15 +145,12 @@ type
                                TSimpleSharedMemory
 --------------------------------------------------------------------------------
 ===============================================================================}
-{$IFDEF Linux}
 type
-  TSharedMemoryHeader = record
-    RefLock:      TFutex;
-    RefCount:     Int32;
-    Synchronizer: pthread_mutex_t;
-  end;
-  PSharedMemoryHeader = ^TSharedMemoryHeader;
-{$ENDIF}
+  TCreationOption = (coRegisterInstance,coCrossArchitecture,coRobustInstance);
+  TCreationOptions = set of TCreationOption;
+
+const
+  SHMS_CREATOPTS_DEFAULT = [{$IFNDEF Windows}coRegisterInstance,coRobustInstance{$ENDIF}];
 
 {===============================================================================
     TSimpleSharedMemory - class declaration
@@ -158,26 +158,29 @@ type
 type
   TSimpleSharedMemory = class(TCustomObject)
   protected
-    fName:        String;
-    fMemory:      Pointer;
-    fSize:        TMemSize;
+    fCreationOptions: TCreationOptions;
+    fName:            String;
+    fMemory:          Pointer;
+    fSize:            TMemSize;
   {$IFDEF Windows}
-    fMappingObj:  THandle;
-    class Function GetMappingSuffix: String; virtual;
+    fMappingObj:      THandle;
+    class Function GetMappingSuffix: WideString; virtual;
   {$ELSE}
-    fMemoryBase:  Pointer;
-    fFullSize:    TMemSize;
-    fHeaderPtr:   PSharedMemoryHeader;
-    procedure InitializeMutex; virtual;
-    procedure FinalizeMutex; virtual;
-    Function TryInitialize: Boolean; virtual;
+    fMemoryBase:      Pointer;    // also address of the header
+    fFullSize:        TMemSize;
   {$ENDIF}
-    procedure Initialize; virtual;
+    procedure InitializeSectionLock; virtual;
+    procedure FinalizeSectionLock; virtual;
+    procedure Initialize(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions); virtual;
     procedure Finalize; virtual;
     class Function RectifyName(const Name: String): String; virtual;
   public
-    constructor Create(InitSize: TMemSize; const Name: String);
+    constructor Create(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions = SHMS_CREATOPTS_DEFAULT);
     destructor Destroy; override;
+    Function RegisteredInstance: Boolean; virtual;
+    procedure RegisterInstance; virtual;
+    procedure UnregisterInstance; virtual;
+    property CreationOptions: TCreationOptions read fCreationOptions;
     property Name: String read fName;
     property Memory: Pointer read fMemory;
     property Size: TMemSize read fSize;
@@ -196,13 +199,10 @@ type
   protected
   {$IFDEF Windows}
     fMappingSync: THandle;
-    class Function GetMappingSuffix: String; override;
-    procedure Initialize; override;
-    procedure Finalize; override;
-  {$ELSE}
-    procedure InitializeMutex; override;
-    procedure FinalizeMutex; override;
+    class Function GetMappingSuffix: WideString; override;
   {$ENDIF}
+    procedure InitializeSectionLock; override;
+    procedure FinalizeSectionLock; override;
   public
     procedure Lock; virtual;
     procedure Unlock; virtual;
@@ -221,9 +221,9 @@ type
   protected
     fSharedMemory:  TSimpleSharedMemory;
     Function GetName: String; virtual;
-    class Function GetSharedMemoryInstance(InitSize: TMemSize; const Name: String): TSimpleSharedMemory; virtual;
+    class Function GetSharedMemoryInstance(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions): TSimpleSharedMemory; virtual;
   public
-    constructor Create(InitSize: TMemSize; const Name: String);
+    constructor Create(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions = SHMS_CREATOPTS_DEFAULT);
     destructor Destroy; override;
     Function Read(var Buffer; Count: LongInt): LongInt; override;
     Function Write(const Buffer; Count: LongInt): LongInt; override;
@@ -241,7 +241,7 @@ type
 type
   TSharedMemoryStream = class(TSimpleSharedMemoryStream)
   protected
-    class Function GetSharedMemoryInstance(InitSize: TMemSize; const Name: String): TSimpleSharedMemory; override;
+    class Function GetSharedMemoryInstance(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions): TSimpleSharedMemory; override;
   public
     procedure Lock; virtual;
     procedure Unlock; virtual;
@@ -252,8 +252,8 @@ type
 implementation
 
 uses
-  {$IFDEF Windows}Windows,{$ELSE}unixtype, StrUtils,{$ENDIF}
-  StrRect;
+  {$IFDEF Windows}Windows,{$ELSE}UnixType, StrUtils,{$ENDIF} SyncObjs, Contnrs,
+  {$IFNDEF Windows}InterlockedOps,{$ENDIF} StrRect;
 
 {$IFDEF Linux}
   {$LINKLIB libc}
@@ -272,7 +272,6 @@ uses
 --------------------------------------------------------------------------------
 ===============================================================================}
 {$IFDEF Windows}
-
 const
 {
   Do not change to prefixes! It would interfere with system prefixes added to
@@ -280,16 +279,14 @@ const
 
   Both suffixes MUST be the same length.
 }
-  SHMS_NAME_SUFFIX_SECT = '@shms_sect'; // section :P
-  SHMS_NAME_SUFFIX_SYNC = '@shms_sync';
-
-  SHMS_NAME_SUFFIX_LEN = Length(SHMS_NAME_SUFFIX_SECT);
+  SHMS_NAME_SUFFIX_SECT = WideString('@shms_sect'); // section :P
+  SHMS_NAME_SUFFIX_SYNC = WideString('@shms_sync');
 
 {$IF not Declared(UNICODE_STRING_MAX_CHARS)}
   UNICODE_STRING_MAX_CHARS = 32767;
 {$IFEND}
 
-{$ELSE}
+{$ELSE}//-----------------------------------------------------------------------
 
 Function errno_ptr: pcint; cdecl; external name '__errno_location';
 Function sched_yield: cint; cdecl; external;
@@ -322,6 +319,8 @@ Function pthread_mutex_consistent(mutex: pthread_mutex_p): cint; cdecl; external
 Function shm_open(name: pchar; oflag: cint; mode: mode_t): cint; cdecl; external;
 Function shm_unlink(name: pchar): cint; cdecl; external;
 
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
 threadvar
   ThrErrorCode: cInt;
 
@@ -334,7 +333,112 @@ else
   ThrErrorCode := ErrorCode;
 end;
 
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+type
+  TSharedMemoryHeader = record
+    HeaderLock:     TSimpleRobustMutexState;
+    Flags:          UInt32;
+    ReferenceCount: Int32;
+    SectionLock:    record
+      case Integer of
+        0: (PthreadMutex: pthread_mutex_t);
+        1: (SimpleMutex:  TSimpleRecursiveMutexState);
+    end;
+  end;
+  PSharedMemoryHeader = ^TSharedMemoryHeader;
+
+const
+  SHMS_HEADFLAG_SECTLOCK  = 1;
+  SHMS_HEADFLAG_CROSSARCH = 2;
+  SHMS_HEADFLAG_ROBUST    = 4;
+  SHMS_HEADFLAG_64BIT     = 8;
+
 {$ENDIF}
+
+{===============================================================================
+    TSimpleSharedMemory - instance cleanup
+===============================================================================}
+{
+  Following code is here to automatically free instances of shared memory
+  objects that are still unfreed at the program termination.
+
+  In Windows, these dangling instances pose no problem, because system
+  automatically closes all handles when the process exits. But in Linux,
+  we manage reference count internally, and any instance that is not freed
+  explicitly would leave that count in inconsistent state.
+
+  But note that this protects only when the process exits normally, not when it
+  is killed or crashes.
+}
+var
+  InstancesSync:  TCriticalSection = nil;
+  Instances:      TObjectList = nil;
+
+//------------------------------------------------------------------------------
+
+procedure InstanceCleanupInitialize;
+begin
+InstancesSync := TCriticalSection.Create;
+Instances := TObjectList.Create(True);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure InstanceCleanupFinalize;
+begin
+FreeAndNil(Instances);  // all still registered instances are freed here
+FreeAndNil(InstancesSync);
+end;
+
+//==============================================================================
+
+Function InstanceCleanupRegistered(Instance: TObject): Boolean;
+begin
+If Assigned(InstancesSync) and Assigned(Instances) then
+  begin
+    InstancesSync.Enter;
+    try
+      Result := Instances.IndexOf(Instance) >= 0;
+    finally
+      InstancesSync.Leave;
+    end;
+  end
+else Result := False;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure InstanceCleanupRegister(Instance: TObject);
+begin
+If Assigned(InstancesSync) and Assigned(Instances) then
+  begin
+    InstancesSync.Enter;
+    try
+      // add the instance only when not already present
+      If Instances.IndexOf(Instance) < 0 then
+        Instances.Add(Instance);
+    finally
+      InstancesSync.Leave;
+    end;
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure InstanceCleanupUnregister(Instance: TObject);
+begin
+If Assigned(InstancesSync) and Assigned(Instances) then
+  begin
+    InstancesSync.Enter;
+    try
+      // do not call Remove, as that would free the object
+      Instances.Extract(Instance);
+    finally
+      InstancesSync.Leave;
+    end;
+  end;
+end;
+
 
 {===============================================================================
     TSimpleSharedMemory - class implementation
@@ -342,197 +446,270 @@ end;
 {-------------------------------------------------------------------------------
     TSimpleSharedMemory - protected methods
 -------------------------------------------------------------------------------}
-
 {$IFDEF Windows}
-
-class Function TSimpleSharedMemory.GetMappingSuffix: String;
+class Function TSimpleSharedMemory.GetMappingSuffix: WideString;
 begin
 Result := '';
 end;
 
 //------------------------------------------------------------------------------
+{$ENDIF}
 
-procedure TSimpleSharedMemory.Initialize;
+procedure TSimpleSharedMemory.InitializeSectionLock;
 begin
+// do nothing here, section lock is only created in non-simple descendants
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSimpleSharedMemory.FinalizeSectionLock;
+begin
+// do nothing...
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSimpleSharedMemory.Initialize(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions);
+
+{$IFNDEF Windows}
+
+  procedure InitializeHeaderFlags(HeaderPtr: PSharedMemoryHeader);
+  begin
+    HeaderPtr^.Flags := 0;
+    If Self.InheritsFrom(TSharedMemory{NOT simple}) then
+      HeaderPtr^.Flags := HeaderPtr^.Flags or SHMS_HEADFLAG_SECTLOCK;
+    If coCrossArchitecture in fCreationOptions then
+      HeaderPtr^.Flags := HeaderPtr^.Flags or SHMS_HEADFLAG_CROSSARCH;
+    If coRobustInstance in fCreationOptions then
+      HeaderPtr^.Flags := HeaderPtr^.Flags or SHMS_HEADFLAG_ROBUST;
+  {$IFDEF CPU64bit}
+    HeaderPtr^.Flags := HeaderPtr^.Flags or SHMS_HEADFLAG_64BIT;
+  {$ELSE}
+    HeaderPtr^.Flags := HeaderPtr^.Flags and not SHMS_HEADFLAG_64BIT;
+  {$ENDIF}
+  end;
+
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+
+  procedure CheckHeaderFlags(HeaderPtr: PSharedMemoryHeader);
+  begin
+    If Self.InheritsFrom(TSharedMemory) <> (HeaderPtr^.Flags and SHMS_HEADFLAG_SECTLOCK <> 0) then
+      raise ESHMSMappingIncompatible.Create('TSimpleSharedMemory.Initialize.CheckHeaderFlags: Section lock incompatibility.');
+    If (coCrossArchitecture in fCreationOptions) <> (HeaderPtr^.Flags and SHMS_HEADFLAG_CROSSARCH <> 0) then
+      raise ESHMSMappingIncompatible.Create('TSimpleSharedMemory.Initialize.CheckHeaderFlags: Cross-architecture incompatibility.');
+    If (coRobustInstance in fCreationOptions) <> (HeaderPtr^.Flags and SHMS_HEADFLAG_ROBUST <> 0) then
+      raise ESHMSMappingIncompatible.Create('TSimpleSharedMemory.Initialize.CheckHeaderFlags: Robustness incompatibility.');
+    If not (coCrossArchitecture in fCreationOptions) then
+      begin
+      {$IFDEF CPU64bit}
+        If HeaderPtr^.Flags and SHMS_HEADFLAG_64BIT = 0 then
+      {$ELSE}
+        If HeaderPtr^.Flags and SHMS_HEADFLAG_64BIT <> 0 then
+      {$ENDIF}
+          raise ESHMSMappingIncompatible.Create('TSimpleSharedMemory.Initialize.CheckHeaderFlags: Binary incompatibility.');
+      end;
+  end;
+
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --   
+
+  Function TryInitialize: Boolean;
+  var
+    MappingObj: cint;
+    HeaderPtr:  PSharedMemoryHeader;
+  begin
+    Result := False;
+    // add space for header, ensure alignment on 1024 bits (128 bytes) boundary
+    fFullSize := (TMemSize(SizeOf(TSharedMemoryHeader) + 127) and not TMemSize(127)) + fSize;
+    // create/open mapping
+    MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
+    If MappingObj >= 0 then
+      try
+        If ftruncate(MappingObj,off_t(fFullSize)) < 0 then
+          raise ESHMSMappingTruncateError.CreateFmt('TSimpleSharedMemory.Initialize.TryInitialize: Failed to truncate mapping (%d).',[errno_ptr^]);
+        // ensure the header lock sees zeroed memory in case the mapping was just now created
+        ReadWriteBarrier;
+        // map file into memory
+        fMemoryBase := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
+        If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1){MAP_FAILED}) then
+          begin
+            HeaderPtr := fMemoryBase;
+          {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
+            fMemory := Pointer(PtrUInt(fMemoryBase) + PtrUInt(fFullSize - fSize));
+          {$IFDEF FPCDWM}{$POP}{$ENDIF}
+            SimpleRobustMutexLock(HeaderPtr^.HeaderLock);
+            try
+              If HeaderPtr^.ReferenceCount = 0 then
+                begin
+                {
+                  This is the first time the mapping is accessed - set flags,
+                  create section lock (if required) and set reference count to 1.
+                }
+                  InitializeHeaderFlags(HeaderPtr);
+                  InitializeSectionLock;
+                  HeaderPtr^.ReferenceCount := 1;
+                  Result := True;
+                end
+              else If HeaderPtr^.ReferenceCount > 0 then
+                begin
+                {
+                  The mapping and section lock are set up, check flags against
+                  creation options and then increase reference count.
+                }
+                  CheckHeaderFlags(HeaderPtr);
+                  Inc(HeaderPtr^.ReferenceCount);
+                  Result := True;
+                end
+            {
+              The mapping was unlinked and section lock destroyed somewhere
+              between shm_open and SimpleRobustMutexLock - drop current mapping
+              and start mapping again from scratch.
+            }
+              else munmap(fMemoryBase,size_t(fFullSize));
+            finally
+              SimpleRobustMutexUnlock(HeaderPtr^.HeaderLock);
+            end;
+          end
+        else raise ESHMSMemoryMappingError.CreateFmt('TSimpleSharedMemory.Initialize.TryInitialize: Failed to map memory (%d).',[errno_ptr^]);
+      finally
+        close(MappingObj);
+      end
+    else raise ESHMSMappingCreationError.CreateFmt('TSimpleSharedMemory.Initialize.TryInitialize: Failed to create mapping (%d).',[errno_ptr^]);
+  end;
+
+{$ENDIF}
+
+begin
+fCreationOptions := CreationOptions;
+{$IFNDEF Windows}
+If coRobustInstance in fCreationOptions then
+  Include(fCreationOptions,coRegisterInstance);
+{$ENDIF}
+If coRegisterInstance in fCreationOptions then
+  RegisterInstance;
+fName := RectifyName(Name);
+If Length(fName) <= 0 then
+  raise ESHMSInvalidValue.Create('TSimpleSharedMemory.Initialize: Empty name not allowed.');
+fSize := InitSize;
+{$IFDEF Windows}
+InitializeSectionLock;
 // create/open memory mapping
-fMappingObj := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,DWORD(UInt64(fSize) shr 32),
-                                  DWORD(fSize),PWideChar(StrToWide(fName + GetMappingSuffix)));
+fMappingObj := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,
+  DWORD(UInt64(fSize) shr 32),DWORD(fSize),PWideChar(StrToWide(fName) + GetMappingSuffix));
 If fMappingObj = 0 then
   raise ESHMSMappingCreationError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to create mapping (%d).',[GetLastError]);
 // map memory
 fMemory := MapViewOfFile(fMappingObj,FILE_MAP_ALL_ACCESS,0,0,fSize);
 If not Assigned(fMemory) then
   raise ESHMSMemoryMappingError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to map memory (%d).',[GetLastError]);
+{$ELSE}
+while not TryInitialize do
+  sched_yield;
+{$ENDIF}
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TSimpleSharedMemory.Finalize;
+{$IFDEF Windows}
 begin
 UnmapViewOfFile(Memory);
 CloseHandle(fMappingObj);
-end;
-
-//------------------------------------------------------------------------------
-
-class Function TSimpleSharedMemory.RectifyName(const Name: String): String;
+FinalizeSectionLock;
+{$ELSE}
 var
-  i,Cnt:  Integer;
-begin
-{
-  Convert to lower case and limit the length while accounting for suffixes.
-  There can be exactly one backslash (separating namespace prefix), replace
-  other backslashes by underscores.
-}
-Result := AnsiLowerCase(Name);
-If (Length(Result) + SHMS_NAME_SUFFIX_LEN) > UNICODE_STRING_MAX_CHARS then
-  SetLength(Result,UNICODE_STRING_MAX_CHARS - SHMS_NAME_SUFFIX_LEN);
-Cnt := 0;
-For i := 1 to Length(Result) do
-  If Result[i] = '\' then
-    begin
-      If Cnt > 0 then
-        Result[i] := '_';
-      Inc(Cnt);
-    end;
-end;
-
-{$ELSE}//=======================================================================
-
-procedure TSimpleSharedMemory.InitializeMutex;
-begin
-// do nothing
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TSimpleSharedMemory.FinalizeMutex;
-begin
-// do nothing
-end;
-
-//------------------------------------------------------------------------------
-
-Function TSimpleSharedMemory.TryInitialize: Boolean;
-var
-  MappingObj: cint;
-begin
-Result := False;
-// add space for header
-fFullSize := (TMemSize(SizeOf(TSharedMemoryHeader) + 127) and not TMemSize(127)) + fSize;
-// create/open mapping
-MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
-If MappingObj >= 0 then
-  try
-    If ftruncate(MappingObj,off_t(fFullSize)) < 0 then
-      raise ESHMSMappingTruncateError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to truncate mapping (%d).',[errno_ptr^]);
-    // map file into memory
-    fMemoryBase := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
-    If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1){MAP_FAILED}) then
-      begin
-        fHeaderPtr := fMemoryBase;
-      {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
-        fMemory := Pointer(PtrUInt(fMemoryBase) + (PtrUInt(SizeOf(TSharedMemoryHeader) + 127) and not PtrUInt(127)));
-      {$IFDEF FPCDWM}{$POP}{$ENDIF}
-        SimpleMutexLock(fHeaderPtr^.RefLock);
-        try
-          If fHeaderPtr^.RefCount = 0 then
-            begin
-            {
-              This is the first time the mapping is accessed - create mutex and
-              set reference count to 1.
-            }
-              InitializeMutex;
-              fHeaderPtr^.RefCount := 1;
-              Result := True
-            end
-          else If fHeaderPtr^.RefCount > 0 then
-            begin
-              // The mapping and mutex is set up, only increase reference count.
-              Inc(fHeaderPtr^.RefCount);
-              Result := True;
-            end
-        {
-          The mapping was unlinked and mutex destroyed somewhere between
-          shm_open and SimpleFutexLock - drop current mapping and start mapping
-          again from scratch.
-        }
-          else munmap(fMemoryBase,size_t(fFullSize));
-        finally
-          SimpleMutexUnlock(fHeaderPtr^.RefLock);
-        end;
-      end
-    else raise ESHMSMemoryMappingError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to map memory (%d).',[errno_ptr^]);
-  finally
-    close(MappingObj);
-  end
-else raise ESHMSMappingCreationError.CreateFmt('TSimpleSharedMemory.Initialize: Failed to create mapping (%d).',[errno_ptr^]);
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TSimpleSharedMemory.Initialize;
-begin
-while not TryInitialize do
-  sched_yield;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TSimpleSharedMemory.Finalize;
+  HeaderPtr:  PSharedMemoryHeader;
 begin
 {
   If there was exception in the constructor, the header pointer might not be
   set by this point.
 }
-If Assigned(fHeaderPtr) then
+If Assigned(fMemoryBase) then
   begin
-    SimpleMutexLock(fHeaderPtr^.RefLock);
+    HeaderPtr := fMemoryBase;
+    SimpleRobustMutexLock(HeaderPtr^.HeaderLock);
     try
-      If fHeaderPtr^.RefCount = 0 then
+      If HeaderPtr^.ReferenceCount = 0 then
         begin
         {
           Zero should be possible only if the initialization failed when
-          creating the mutex.
-          Unlink the mapping but do not destroy mutex (it should not exist).
+          creating the section lock.
+          Unlink the mapping but do not destroy section lock as it should not
+          exist.
         }
-          fHeaderPtr^.RefCount := -1;
+          HeaderPtr^.ReferenceCount := -1;
           shm_unlink(PChar(StrToSys(fName)));
         end
-      else If fHeaderPtr^.RefCount = 1 then
+      else If HeaderPtr^.ReferenceCount = 1 then
         begin
         {
-          This is the last instance, destroy mutex and unlink the mapping.
+          This is the last instance, destroy section lock and unlink the
+          mapping.
           Set reference counter to -1 to indicate it is being destroyed.
         }
-          fHeaderPtr^.RefCount := -1;
-          // destroy mutex
-          FinalizeMutex;
+          HeaderPtr^.ReferenceCount := -1;
+          // destroy section lock
+          FinalizeSectionLock;
           // unlink mapping (ignore errors)
           shm_unlink(PChar(StrToSys(fName)));
         end
-      else If fHeaderPtr^.RefCount > 1 then
-        Dec(fHeaderPtr^.RefCount);
+      else If HeaderPtr^.ReferenceCount > 1 then
+        Dec(HeaderPtr^.ReferenceCount);
       {
         Negative value means the mapping is already being destroyed elsewhere,
         so do nothing.
       }
     finally
-      SimpleMutexUnlock(fHeaderPtr^.RefLock);
+      SimpleRobustMutexUnlock(HeaderPtr^.HeaderLock);
     end;
   end;
 // unmapping is done in any case...
 If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1)) then
   munmap(fMemoryBase,size_t(fFullSize));
+{$ENDIF}
+{
+  Try to unregister this instance irrespective of creation options - the
+  instance could have been registered by the user (by a call to method
+  RegisterInstance) without including coRegisterInstance option.
+}
+UnregisterInstance;
 end;
 
 //------------------------------------------------------------------------------
 
 class Function TSimpleSharedMemory.RectifyName(const Name: String): String;
 var
-  i:  Integer;
+  i:        Integer;
+{$IFDEF Windows}
+  Cnt:      Integer;
+  TempWStr: WideString;
 begin
 {
+  Windows
+
+  Convert to lower case and limit the length while accounting for suffixes.
+  There can be exactly one backslash (separating namespace prefix), replace
+  other backslashes by underscores.
+
+  Also note that all system calls here are done to unicode functions, so we
+  must work with unicode-encoded string.
+}
+TempWStr := StrToWide(AnsiLowerCase(Name));
+If (Length(TempWStr) + Length(GetMappingSuffix)) > UNICODE_STRING_MAX_CHARS then
+  SetLength(TempWStr,UNICODE_STRING_MAX_CHARS - Length(GetMappingSuffix));
+Cnt := 0;
+For i := 1 to Length(TempWStr) do
+  If TempWStr[i] = '\' then
+    begin
+      If Cnt > 0 then
+        TempWStr[i] := '_';
+      Inc(Cnt);
+    end;
+Result := WideToStr(TempWStr);
+{$ELSE}
+begin
+{
+  Linux
+
   The name must start with forward slash and must not contain any more fwd.
   slashes.
   Check if there is leading slash and add it when isn't, replace other slashes
@@ -548,22 +725,17 @@ If Length(Result) > NAME_MAX then
 For i := 2 to Length(Result) do
   If Result[i] = '/' then
     Result[i] := '_';
-end;
-
 {$ENDIF}
+end;
 
 {-------------------------------------------------------------------------------
     TSimpleSharedMemory - public methods
 -------------------------------------------------------------------------------}
 
-constructor TSimpleSharedMemory.Create(InitSize: TMemSize; const Name: String);
+constructor TSimpleSharedMemory.Create(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions = SHMS_CREATOPTS_DEFAULT);
 begin
 inherited Create;
-fName := RectifyName(Name);
-If Length(fName) <= 0 then
-  raise ESHMSInvalidValue.Create('TSimpleSharedMemory.Create: Empty name not allowed.');
-fSize := InitSize;
-Initialize;
+Initialize(InitSize,Name,CreationOptions);
 end;
 
 //------------------------------------------------------------------------------
@@ -572,6 +744,27 @@ destructor TSimpleSharedMemory.Destroy;
 begin
 Finalize;
 inherited;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleSharedMemory.RegisteredInstance: Boolean;
+begin
+Result := InstanceCleanupRegistered(Self);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSimpleSharedMemory.RegisterInstance;
+begin
+InstanceCleanupRegister(Self);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSimpleSharedMemory.UnregisterInstance;
+begin
+InstanceCleanupUnregister(Self);
 end;
 
 {===============================================================================
@@ -585,66 +778,62 @@ end;
 {-------------------------------------------------------------------------------
     TSharedMemory - protected methods
 -------------------------------------------------------------------------------}
-
 {$IFDEF Windows}
-
-class Function TSharedMemory.GetMappingSuffix: String;
+class Function TSharedMemory.GetMappingSuffix: WideString;
 begin
 // do not call inherited code
 Result := SHMS_NAME_SUFFIX_SECT;
 end;
 
 //------------------------------------------------------------------------------
+{$ENDIF}
 
-procedure TSharedMemory.Initialize;
+procedure TSharedMemory.InitializeSectionLock;
+{$IFDEF Windows}
 begin
 // create/open synchronization mutex
-fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(fName + SHMS_NAME_SUFFIX_SYNC)));
+fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(fName) + SHMS_NAME_SUFFIX_SYNC));
 If fMappingSync = 0 then
-  raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.Initialize: Failed to create mutex (%d).',[GetLastError]);
-inherited;
+  raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to create mutex (%d).',[GetLastError]);
 end;
-
-//------------------------------------------------------------------------------
-
-procedure TSharedMemory.Finalize;
-begin
-inherited;
-CloseHandle(fMappingSync);
-end;
-
 {$ELSE}
-//------------------------------------------------------------------------------
-
-procedure TSharedMemory.InitializeMutex;
 var
   MutexAttr:  pthread_mutexattr_t;
 begin
-If ErrChk(pthread_mutexattr_init(@MutexAttr)) then
-  try
-    If not ErrChk(pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED)) then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute pshared (%d).',[ThrErrorCode]);
-    If not ErrChk(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute type (%d).',[ThrErrorCode]);
-    If not ErrChk(pthread_mutexattr_setrobust(@MutexAttr,PTHREAD_MUTEX_ROBUST)) then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to set mutex attribute robust (%d).',[ThrErrorCode]);
-    If not ErrChk(pthread_mutex_init(Addr(fHeaderPtr^.Synchronizer),@MutexAttr)) then
-      raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex (%d).',[ThrErrorCode]);
-  finally
-    pthread_mutexattr_destroy(@MutexAttr);
+If not (ctCrossArchitecture in fCreationOptions) then
+  begin
+    If ErrChk(pthread_mutexattr_init(@MutexAttr)) then
+      try
+        If not ErrChk(pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED)) then
+          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to set mutex attribute pshared (%d).',[ThrErrorCode]);
+        If not ErrChk(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
+          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to set mutex attribute type (%d).',[ThrErrorCode]);
+        If not ErrChk(pthread_mutexattr_setrobust(@MutexAttr,PTHREAD_MUTEX_ROBUST)) then
+          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to set mutex attribute robust (%d).',[ThrErrorCode]);
+        If not ErrChk(pthread_mutex_init(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex),@MutexAttr)) then
+          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to init mutex (%d).',[ThrErrorCode]);
+      finally
+        pthread_mutexattr_destroy(@MutexAttr);
+      end
+    else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to init mutex attributes (%d).',[ThrErrorCode]);
   end
-else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeMutex: Failed to init mutex attributes (%d).',[ThrErrorCode]);
+else SimpleRecursiveMutexInit(PSharedMemoryHeader(fMemoryBase)^.SectionLock.SimpleMutex);
 end;
+{$ENDIF}
 
 //------------------------------------------------------------------------------
 
-procedure TSharedMemory.FinalizeMutex;
+procedure TSharedMemory.FinalizeSectionLock;
 begin
-// ignore errors
-pthread_mutex_destroy(Addr(fHeaderPtr^.Synchronizer));
-end;
-
+{$IFDEF Windows}
+CloseHandle(fMappingSync);
+{$ELSE}
+If not (ctCrossArchitecture in fCreationOptions) then
+  pthread_mutex_destroy(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex)) // ignore errors
+else
+  SimpleRecursiveMutexInit(PSharedMemoryHeader(fMemoryBase)^.SectionLock.SimpleMutex);    // using init here is not an error
 {$ENDIF}
+end;
 
 {-------------------------------------------------------------------------------
     TSharedMemory - public methods
@@ -660,18 +849,22 @@ end;
 var
   ReturnValue:  cint;
 begin
-ReturnValue := pthread_mutex_lock(Addr(fHeaderPtr^.Synchronizer));
-If ReturnValue = ESysEOWNERDEAD then
+If not (ctCrossArchitecture in fCreationOptions) then
   begin
-  {
-    Owner of the mutex died, it is now owned by the calling thread, but must
-    be made consistent to use it again.
-  }
-    If not ErrChk(pthread_mutex_consistent(Addr(fHeaderPtr^.Synchronizer))) then
-      raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to make mutex consistent (%d).',[ThrErrorCode]);
+    ReturnValue := pthread_mutex_lock(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex));
+    If ReturnValue = ESysEOWNERDEAD then
+      begin
+      {
+        Owner of the mutex died, it is now owned by the calling thread, but
+        must be made consistent to use it again.
+      }
+        If not ErrChk(pthread_mutex_consistent(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex))) then
+          raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to make mutex consistent (%d).',[ThrErrorCode]);
+      end
+    else If not ErrChk(ReturnValue) then
+      raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[ThrErrorCode]);
   end
-else If not ErrChk(ReturnValue) then
-  raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[ThrErrorCode]);
+else SimpleRecursiveMutexLock(PSharedMemoryHeader(fMemoryBase)^.SectionLock.SimpleMutex);
 end;
 {$ENDIF}
 
@@ -683,11 +876,14 @@ begin
 If not ReleaseMutex(fMappingSync) then
   raise ESHMSUnlockError.CreateFmt('TSharedMemory.Unlock: Failed to unlock (%d).',[GetLastError]);
 {$ELSE}
-If not ErrChk(pthread_mutex_unlock(Addr(fHeaderPtr^.Synchronizer))) then
-  raise ESHMSUnlockError.CreateFmt('TSharedMemory.Unlock: Failed to unlock (%d).',[ThrErrorCode]);
+If not (ctCrossArchitecture in fCreationOptions) then
+  begin
+    If not ErrChk(pthread_mutex_unlock(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex))) then
+      raise ESHMSUnlockError.CreateFmt('TSharedMemory.Unlock: Failed to unlock (%d).',[ThrErrorCode]);
+  end
+else SimpleRecursiveMutexUnlock(PSharedMemoryHeader(fMemoryBase)^.SectionLock.SimpleMutex);
 {$ENDIF}
 end;
-
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -708,20 +904,20 @@ end;
 
 //------------------------------------------------------------------------------
 
-class Function TSimpleSharedMemoryStream.GetSharedMemoryInstance(InitSize: TMemSize; const Name: String): TSimpleSharedMemory;
+class Function TSimpleSharedMemoryStream.GetSharedMemoryInstance(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions): TSimpleSharedMemory;
 begin
-Result := TSimpleSharedMemory.Create(InitSize,Name);
+Result := TSimpleSharedMemory.Create(InitSize,Name,CreationOptions);
 end;
 
 {-------------------------------------------------------------------------------
     TSharedMemoryStream - public methods
 -------------------------------------------------------------------------------}
 
-constructor TSimpleSharedMemoryStream.Create(InitSize: TMemSize; const Name: String);
+constructor TSimpleSharedMemoryStream.Create(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions = SHMS_CREATOPTS_DEFAULT);
 var
   SharedMemory: TSimpleSharedMemory;
 begin
-SharedMemory := GetSharedMemoryInstance(InitSize,Name);
+SharedMemory := GetSharedMemoryInstance(InitSize,Name,CreationOptions);
 try
   inherited Create(SharedMemory.Memory,SharedMemory.Size);
 except
@@ -767,10 +963,10 @@ end;
     TSharedMemoryStream - protected methods
 -------------------------------------------------------------------------------}
 
-class Function TSharedMemoryStream.GetSharedMemoryInstance(InitSize: TMemSize; const Name: String): TSimpleSharedMemory;
+class Function TSharedMemoryStream.GetSharedMemoryInstance(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions): TSimpleSharedMemory;
 begin
 // do not call inherited code
-Result := TSharedMemory.Create(InitSize,Name);
+Result := TSharedMemory.Create(InitSize,Name,CreationOptions);
 end;
 
 {-------------------------------------------------------------------------------
@@ -812,5 +1008,17 @@ finally
   Unlock;
 end;
 end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 Unit init/final
+--------------------------------------------------------------------------------
+===============================================================================}
+initialization
+  InstanceCleanupInitialize;
+
+finalization
+  InstanceCleanupFinalize;
 
 end.
