@@ -57,6 +57,7 @@
     AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
   * AuxExceptions      - github.com/TheLazyTomcat/Lib.AuxExceptions
     AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
+  * InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
   * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex
     StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
     StrRect            - github.com/TheLazyTomcat/Lib.StrRect
@@ -64,16 +65,16 @@
   Library AuxExceptions is required only when rebasing local exception classes
   (see symbol SharedMemoryStream_UseAuxExceptions for details).
 
-  Library SimpleFutex is required only when compiling for Linux operating
-  system.
+  Libraries SimpleFutex and InterlockedOps are required only when compiling for
+  Linux operating system.
 
-  Library AuxExceptions might also be required as an indirect dependency.
+  Libraries AuxExceptions and InterlockedOps might also be required as an
+  indirect dependencies.
 
   Indirect dependencies:
-    InterlockedOps - github.com/TheLazyTomcat/Lib.InterlockedOps
-    SimpleCPUID    - github.com/TheLazyTomcat/Lib.SimpleCPUID
-    UInt64Utils    - github.com/TheLazyTomcat/Lib.UInt64Utils
-    WinFileInfo    - github.com/TheLazyTomcat/Lib.WinFileInfo
+    SimpleCPUID - github.com/TheLazyTomcat/Lib.SimpleCPUID
+    UInt64Utils - github.com/TheLazyTomcat/Lib.UInt64Utils
+    WinFileInfo - github.com/TheLazyTomcat/Lib.WinFileInfo
 
 ===============================================================================}
 unit SharedMemoryStream;
@@ -150,7 +151,7 @@ type
   TCreationOptions = set of TCreationOption;
 
 const
-  SHMS_CREATOPTS_DEFAULT = [{$IFNDEF Windows}coRegisterInstance,coRobustInstance{$ENDIF}];
+  SHMS_CREATOPTS_DEFAULT = [coRegisterInstance{$IFNDEF Windows},coRobustInstance{$ENDIF}];
 
 {===============================================================================
     TSimpleSharedMemory - class declaration
@@ -371,36 +372,38 @@ const
   is killed or crashes.
 }
 var
-  InstancesSync:  TCriticalSection = nil;
-  Instances:      TObjectList = nil;
+  IC_InstancesSync:  TCriticalSection = nil;
+  IC_Instances:      TObjectList = nil;
+  IC_Finalizing:     Boolean = False;
 
 //------------------------------------------------------------------------------
 
 procedure InstanceCleanupInitialize;
 begin
-InstancesSync := TCriticalSection.Create;
-Instances := TObjectList.Create(True);
+IC_InstancesSync := TCriticalSection.Create;
+IC_Instances := TObjectList.Create(True);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure InstanceCleanupFinalize;
 begin
-FreeAndNil(Instances);  // all still registered instances are freed here
-FreeAndNil(InstancesSync);
+IC_Finalizing := True;
+FreeAndNil(IC_Instances); // all still registered instances are freed here
+FreeAndNil(IC_InstancesSync);
 end;
 
 //==============================================================================
 
 Function InstanceCleanupRegistered(Instance: TObject): Boolean;
 begin
-If Assigned(InstancesSync) and Assigned(Instances) then
+If not IC_Finalizing then
   begin
-    InstancesSync.Enter;
+    IC_InstancesSync.Enter;
     try
-      Result := Instances.IndexOf(Instance) >= 0;
+      Result := IC_Instances.IndexOf(Instance) >= 0;
     finally
-      InstancesSync.Leave;
+      IC_InstancesSync.Leave;
     end;
   end
 else Result := False;
@@ -410,15 +413,15 @@ end;
 
 procedure InstanceCleanupRegister(Instance: TObject);
 begin
-If Assigned(InstancesSync) and Assigned(Instances) then
+If not IC_Finalizing then
   begin
-    InstancesSync.Enter;
+    IC_InstancesSync.Enter;
     try
       // add the instance only when not already present
-      If Instances.IndexOf(Instance) < 0 then
-        Instances.Add(Instance);
+      If IC_Instances.IndexOf(Instance) < 0 then
+        IC_Instances.Add(Instance);
     finally
-      InstancesSync.Leave;
+      IC_InstancesSync.Leave;
     end;
   end;
 end;
@@ -427,14 +430,14 @@ end;
 
 procedure InstanceCleanupUnregister(Instance: TObject);
 begin
-If Assigned(InstancesSync) and Assigned(Instances) then
+If not IC_Finalizing then
   begin
-    InstancesSync.Enter;
+    IC_InstancesSync.Enter;
     try
       // do not call Remove, as that would free the object
-      Instances.Extract(Instance);
+      IC_Instances.Extract(Instance);
     finally
-      InstancesSync.Leave;
+      IC_InstancesSync.Leave;
     end;
   end;
 end;
@@ -554,9 +557,13 @@ procedure TSimpleSharedMemory.Initialize(InitSize: TMemSize; const Name: String;
                 {
                   The mapping and section lock are set up, check flags against
                   creation options and then increase reference count.
+
+                  Note that the ref count must be incremented first - if flags
+                  check fails with an exception, then destructor is executed
+                  and the count is decremented there.
                 }
-                  CheckHeaderFlags(HeaderPtr);
                   Inc(HeaderPtr^.ReferenceCount);
+                  CheckHeaderFlags(HeaderPtr);
                   Result := True;
                 end
             {
@@ -800,7 +807,7 @@ end;
 var
   MutexAttr:  pthread_mutexattr_t;
 begin
-If not (ctCrossArchitecture in fCreationOptions) then
+If not (coCrossArchitecture in fCreationOptions) then
   begin
     If ErrChk(pthread_mutexattr_init(@MutexAttr)) then
       try
@@ -828,7 +835,7 @@ begin
 {$IFDEF Windows}
 CloseHandle(fMappingSync);
 {$ELSE}
-If not (ctCrossArchitecture in fCreationOptions) then
+If not (coCrossArchitecture in fCreationOptions) then
   pthread_mutex_destroy(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex)) // ignore errors
 else
   SimpleRecursiveMutexInit(PSharedMemoryHeader(fMemoryBase)^.SectionLock.SimpleMutex);    // using init here is not an error
@@ -849,7 +856,7 @@ end;
 var
   ReturnValue:  cint;
 begin
-If not (ctCrossArchitecture in fCreationOptions) then
+If not (coCrossArchitecture in fCreationOptions) then
   begin
     ReturnValue := pthread_mutex_lock(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex));
     If ReturnValue = ESysEOWNERDEAD then
@@ -876,7 +883,7 @@ begin
 If not ReleaseMutex(fMappingSync) then
   raise ESHMSUnlockError.CreateFmt('TSharedMemory.Unlock: Failed to unlock (%d).',[GetLastError]);
 {$ELSE}
-If not (ctCrossArchitecture in fCreationOptions) then
+If not (coCrossArchitecture in fCreationOptions) then
   begin
     If not ErrChk(pthread_mutex_unlock(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex))) then
       raise ESHMSUnlockError.CreateFmt('TSharedMemory.Unlock: Failed to unlock (%d).',[ThrErrorCode]);
