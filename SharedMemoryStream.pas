@@ -33,11 +33,11 @@
     In non-simple streams, the methods Read and Write are protected by a lock,
     so it is not necessary to lock the access explicitly.
 
-  Version 1.2.6 (2024-05-03)
+  Version 1.3 (2025-02-14)
 
-  Last change 2024-09-09
+  Last change 2025-02-14
 
-  ©2018-2024 František Milt
+  ©2018-2025 František Milt
 
   Contacts:
     František Milt: frantisek.milt@gmail.com
@@ -134,9 +134,11 @@ type
   ESHMSMappingCreationError = class(ESHMSException);
   ESHMSMemoryMappingError   = class(ESHMSException);
 
-  // following two exceptions can only be raised in linux, but are declared everywhere
+  // following four exceptions can be raised only in Linux
   ESHMSMappingTruncateError = class(ESHMSException);
   ESHMSMappingIncompatible  = class(ESHMSException);
+  ESHMSKeyGenerationError   = class(ESHMSException);
+  ESHMSSemaphoreError       = class(ESHMSException);
 
   ESHMSLockError   = class(ESHMSException);
   ESHMSUnlockError = class(ESHMSException);
@@ -147,11 +149,11 @@ type
 --------------------------------------------------------------------------------
 ===============================================================================}
 type
-  TCreationOption = (coRegisterInstance,coCrossArchitecture,coRobustInstance);
+  TCreationOption = (optRegisterInstance,optCrossArchitecture,optRobustInstance);
   TCreationOptions = set of TCreationOption;
 
 const
-  SHMS_CREATOPTS_DEFAULT = [coRegisterInstance{$IFNDEF Windows},coRobustInstance{$ENDIF}];
+  SHMS_CREATOPTS_DEFAULT = [optRegisterInstance{$IFNDEF Windows},optRobustInstance{$ENDIF}];
 
 {===============================================================================
     TSimpleSharedMemory - class declaration
@@ -169,9 +171,13 @@ type
   {$ELSE}
     fMemoryBase:      Pointer;    // also address of the header
     fFullSize:        TMemSize;
+    fRobustCounter:   cint;       // SysV semaphore set ID
+    // all RobustCounter* methods must be executed when header is locked
+    Function RobustCounterAttach: Int32; virtual;
+    Function RobustCounterDetach: Int32; virtual;
   {$ENDIF}
-    procedure InitializeSectionLock; virtual;
-    procedure FinalizeSectionLock; virtual;
+    procedure SectionLockInitialize; virtual;
+    procedure SectionLockFinalize; virtual;
     procedure Initialize(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions); virtual;
     procedure Finalize; virtual;
     class Function RectifyName(const Name: String): String; virtual;
@@ -202,8 +208,8 @@ type
     fMappingSync: THandle;
     class Function GetMappingSuffix: WideString; override;
   {$ENDIF}
-    procedure InitializeSectionLock; override;
-    procedure FinalizeSectionLock; override;
+    procedure SectionLockInitialize; override;
+    procedure SectionLockFinalize; override;
   public
     procedure Lock; virtual;
     procedure Unlock; virtual;
@@ -254,6 +260,7 @@ implementation
 
 uses
   {$IFDEF Windows}Windows,{$ELSE}UnixType, StrUtils,{$ENDIF} SyncObjs, Contnrs,
+  {$IFNDEF FPC}Types{for inline expansion in newer Delphi}, {$ENDIF}
   {$IFNDEF Windows}InterlockedOps,{$ENDIF} StrRect;
 
 {$IFDEF Linux}
@@ -268,9 +275,7 @@ uses
 {$ENDIF}
 
 {===============================================================================
---------------------------------------------------------------------------------
-                               TSimpleSharedMemory
---------------------------------------------------------------------------------
+    Common types, constants, externals, ...
 ===============================================================================}
 {$IFDEF Windows}
 const
@@ -321,6 +326,48 @@ Function shm_open(name: pchar; oflag: cint; mode: mode_t): cint; cdecl; external
 Function shm_unlink(name: pchar): cint; cdecl; external;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+type
+  key_t = cint;
+
+  sembuf_t = record
+    sem_num:  cushort;
+    sem_op:   cshort;
+    sem_flg:  cshort;
+  end;
+  sembuf_p = ^sembuf_t;
+
+{
+  Fields buf and __buf are pointers to specific structures - but since we do
+  not use them here, they are not declared and the fields are just untyped
+  pointers.
+}
+  semun_t = record
+    case Integer of
+      0:  (val:   cint);
+      1:  (buf:   pointer);
+      2:  (arr:   pcushort);  // pointer to array of cushort
+      3:  (__buf: pointer);
+  end;
+
+const
+  IPC_CREAT  = $200;
+  IPC_EXCL   = $400;
+  IPC_NOWAIT = $800;
+
+  IPC_RMID = 0;
+
+  SEM_UNDO = $1000;
+
+  GETVAL = 12;
+  SETVAL = 16;
+
+Function ftok(pathname: pchar; proj_id: cint): key_t; cdecl; external;
+
+Function semget(key: key_t; nsems: cint; semflg: cint): cint; cdecl; external;
+Function semctl(semid: cint; semnum: cint; cmd: cint): cint; varargs; cdecl; external;
+Function semop(semid: cint; sops: sembuf_p; nsops: size_t): cint; cdecl; external;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 threadvar
   ThrErrorCode: cInt;
@@ -334,12 +381,14 @@ else
   ThrErrorCode := ErrorCode;
 end;
 
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+//------------------------------------------------------------------------------
 type
   TSharedMemoryHeader = record
     HeaderLock:     TSimpleRobustMutexState;
+    Version:        UInt32;
     Flags:          UInt32;
     ReferenceCount: Int32;
+    Reserved:       Int32;
     SectionLock:    record
       case Integer of
         0: (PthreadMutex: pthread_mutex_t);
@@ -348,16 +397,21 @@ type
   end;
   PSharedMemoryHeader = ^TSharedMemoryHeader;
 
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 const
   SHMS_HEADFLAG_SECTLOCK  = 1;
   SHMS_HEADFLAG_CROSSARCH = 2;
   SHMS_HEADFLAG_ROBUST    = 4;
   SHMS_HEADFLAG_64BIT     = 8;
 
+  SHMS_INTERNAL_VERSION = 1;
+
 {$ENDIF}
 
 {===============================================================================
-    TSimpleSharedMemory - instance cleanup
+--------------------------------------------------------------------------------
+                                Instance cleanup
+--------------------------------------------------------------------------------
 ===============================================================================}
 {
   Following code is here to automatically free instances of shared memory
@@ -444,6 +498,11 @@ end;
 
 
 {===============================================================================
+--------------------------------------------------------------------------------
+                               TSimpleSharedMemory
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
     TSimpleSharedMemory - class implementation
 ===============================================================================}
 {-------------------------------------------------------------------------------
@@ -456,16 +515,130 @@ Result := '';
 end;
 
 //------------------------------------------------------------------------------
+{$ELSE}
+
+Function TSimpleSharedMemory.RobustCounterAttach: Int32;
+var
+  Key:      key_t;
+  ErrCode:  cint;
+  SemUn:    semun_t;
+  SemBuf:   sembuf_t;
+
+  Function DoRollback(RemoveSemSet: Boolean): cint;
+  begin
+    Result := errno_ptr^;
+    If RemoveSemSet then
+      semctl(fRobustCounter,0,IPC_RMID);  // ignore errors
+    fRobustCounter := -1;
+  end;
+
+begin
+{
+  Note that this entire method, while containing multiple different actions,
+  is executed atomically - that is in its entirety or not at all. In here this
+  means any exception after the semaphore set is created/opened leads to a
+  rollback that reverts previous actions.
+}
+Result := 0;
+fRobustCounter := -1;
+Key := ftok(PChar(StrToSys('/dev/shm' + fName)),1{0 not allowed});
+If Key <> -1 then
+  begin
+    // try to create semaphore set in exclusive mode
+    fRobustCounter := semget(Key,1,IPC_CREAT or IPC_EXCL or S_IRWXU);
+    If fRobustCounter = -1 then
+      begin
+      {
+        Something failed, if it is because the semaphore set already existed
+        then try to open it.
+      }
+        ErrCode := errno_ptr^;
+        If ErrCode = ESysEEXIST then
+          begin
+            fRobustCounter := semget(Key,1,S_IRWXU);
+            If fRobustCounter <> -1 then
+              begin
+                // we have opened the set, get value
+                Result := Int32(semctl(fRobustCounter,0,GETVAL));
+                If Result = -1 then
+                  begin
+                    ErrCode := DoRollback(False);  // do not remove the set, we have only opened it
+                    raise ESHMSSemaphoreError.CreateFmt('TSimpleSharedMemory.RobustCounterAttach: Failed to obtain semaphore value (%d).',[ErrCode]);
+                  end;
+              end
+            else raise ESHMSSemaphoreError.CreateFmt('TSimpleSharedMemory.RobustCounterAttach: Failed to open semaphore (%d).',[errno_ptr^]);
+          end
+        else raise ESHMSSemaphoreError.CreateFmt('TSimpleSharedMemory.RobustCounterAttach: Failed to create semaphore (%d).',[ErrCode]);
+      end
+    else
+      begin
+        // we have created the semaphore, initialize it to zero
+        SemUn.val := 0; // initial value for the semaphore
+        If semctl(fRobustCounter,0,SETVAL,SemUn) = -1 then
+          begin
+            ErrCode := DoRollback(True);
+            raise ESHMSSemaphoreError.CreateFmt('TSimpleSharedMemory.RobustCounterAttach: Failed to initialize semaphore (%d).',[ErrCode]);
+          end;
+      end;
+  end
+else raise ESHMSKeyGenerationError.CreateFmt('TSimpleSharedMemory.RobustCounterAttach: Cannot generate SysV IPC key (%d).',[errno_ptr^]);
+{
+  Now we have the semaphore set open and result is set to its current value,
+  increment it.
+}
+SemBuf.sem_num := 0;
+SemBuf.sem_op := +1;  // increment value by one
+SemBuf.sem_flg := SEM_UNDO;
+If semop(fRobustCounter,@SemBuf,1) = -1 then
+  begin
+    // if result is zero it means we have created the set and therefore can remove it
+    ErrCode := DoRollback(Result = 0);
+    raise ESHMSSemaphoreError.CreateFmt('TSimpleSharedMemory.RobustCounterAttach: Failed to increment semaphore (%d).',[ErrCode]);
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleSharedMemory.RobustCounterDetach: Int32;
+var
+  SemBuf: sembuf_t;
+begin
+{
+  There are no exceptions raised in here as this method is called from
+  destructor - failure is indicated by returning a negative value, which
+  tells destructor to do nothing.
+}
+Result := -1;
+If fRobustCounter <> -1 then
+  begin
+    // first get actual semaphore value
+    Result := Int32(semctl(fRobustCounter,0,GETVAL));
+    If Result <> -1 then
+      begin
+        // we have got the actual value, do decrement
+        SemBuf.sem_num := 0;
+        SemBuf.sem_op := -1;  // decrement value by one
+        SemBuf.sem_flg := IPC_NOWAIT or SEM_UNDO;
+        If semop(fRobustCounter,@SemBuf,1) <> -1 then
+          begin
+            If Result <= 1 then // ie. the semaphore is now at zero
+              semctl(fRobustCounter,0,IPC_RMID);  // ignore errors here
+          end;
+      end;
+  end;
+end;
+
+//------------------------------------------------------------------------------
 {$ENDIF}
 
-procedure TSimpleSharedMemory.InitializeSectionLock;
+procedure TSimpleSharedMemory.SectionLockInitialize;
 begin
 // do nothing here, section lock is only created in non-simple descendants
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleSharedMemory.FinalizeSectionLock;
+procedure TSimpleSharedMemory.SectionLockFinalize;
 begin
 // do nothing...
 end;
@@ -476,111 +649,141 @@ procedure TSimpleSharedMemory.Initialize(InitSize: TMemSize; const Name: String;
 
 {$IFNDEF Windows}
 
-  procedure InitializeHeaderFlags(HeaderPtr: PSharedMemoryHeader);
+  procedure HeaderFlagsAndVersionInit(out Header: TSharedMemoryHeader);
   begin
-    HeaderPtr^.Flags := 0;
+    Header.Flags := 0;
     If Self.InheritsFrom(TSharedMemory{NOT simple}) then
-      HeaderPtr^.Flags := HeaderPtr^.Flags or SHMS_HEADFLAG_SECTLOCK;
-    If coCrossArchitecture in fCreationOptions then
-      HeaderPtr^.Flags := HeaderPtr^.Flags or SHMS_HEADFLAG_CROSSARCH;
-    If coRobustInstance in fCreationOptions then
-      HeaderPtr^.Flags := HeaderPtr^.Flags or SHMS_HEADFLAG_ROBUST;
+      Header.Flags := Header.Flags or SHMS_HEADFLAG_SECTLOCK;
+    If optCrossArchitecture in fCreationOptions then
+      Header.Flags := Header.Flags or SHMS_HEADFLAG_CROSSARCH;
+    If optRobustInstance in fCreationOptions then
+      Header.Flags := Header.Flags or SHMS_HEADFLAG_ROBUST;
   {$IFDEF CPU64bit}
-    HeaderPtr^.Flags := HeaderPtr^.Flags or SHMS_HEADFLAG_64BIT;
+    Header.Flags := Header.Flags or SHMS_HEADFLAG_64BIT;
   {$ELSE}
-    HeaderPtr^.Flags := HeaderPtr^.Flags and not SHMS_HEADFLAG_64BIT;
+    Header.Flags := Header.Flags and not SHMS_HEADFLAG_64BIT;
   {$ENDIF}
+    Header.Version := SHMS_INTERNAL_VERSION;
   end;
 
 //--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
-  procedure CheckHeaderFlags(HeaderPtr: PSharedMemoryHeader);
+  procedure HeaderFlagsAndVersionCheck(var Header: TSharedMemoryHeader);
+  const
+    // to shorten error msgs
+    _FCENAME = 'TSimpleSharedMemory.Initialize.HeaderFlagsAndVersionCheck';
   begin
-    If Self.InheritsFrom(TSharedMemory) <> (HeaderPtr^.Flags and SHMS_HEADFLAG_SECTLOCK <> 0) then
-      raise ESHMSMappingIncompatible.Create('TSimpleSharedMemory.Initialize.CheckHeaderFlags: Section lock incompatibility.');
-    If (coCrossArchitecture in fCreationOptions) <> (HeaderPtr^.Flags and SHMS_HEADFLAG_CROSSARCH <> 0) then
-      raise ESHMSMappingIncompatible.Create('TSimpleSharedMemory.Initialize.CheckHeaderFlags: Cross-architecture incompatibility.');
-    If (coRobustInstance in fCreationOptions) <> (HeaderPtr^.Flags and SHMS_HEADFLAG_ROBUST <> 0) then
-      raise ESHMSMappingIncompatible.Create('TSimpleSharedMemory.Initialize.CheckHeaderFlags: Robustness incompatibility.');
-    If not (coCrossArchitecture in fCreationOptions) then
+    If Self.InheritsFrom(TSharedMemory) <> (Header.Flags and SHMS_HEADFLAG_SECTLOCK <> 0) then
+      raise ESHMSMappingIncompatible.Create(_FCENAME + ': Section lock incompatibility.');
+    If (optCrossArchitecture in fCreationOptions) <> (Header.Flags and SHMS_HEADFLAG_CROSSARCH <> 0) then
+      raise ESHMSMappingIncompatible.Create(_FCENAME + ': Cross-architecture incompatibility.');
+    If (optRobustInstance in fCreationOptions) <> (Header.Flags and SHMS_HEADFLAG_ROBUST <> 0) then
+      raise ESHMSMappingIncompatible.Create(_FCENAME + ': Robustness incompatibility.');
+    If not (optCrossArchitecture in fCreationOptions) then
       begin
       {$IFDEF CPU64bit}
-        If HeaderPtr^.Flags and SHMS_HEADFLAG_64BIT = 0 then
+        If Header.Flags and SHMS_HEADFLAG_64BIT = 0 then
       {$ELSE}
-        If HeaderPtr^.Flags and SHMS_HEADFLAG_64BIT <> 0 then
+        If Header.Flags and SHMS_HEADFLAG_64BIT <> 0 then
       {$ENDIF}
-          raise ESHMSMappingIncompatible.Create('TSimpleSharedMemory.Initialize.CheckHeaderFlags: Binary incompatibility.');
+          raise ESHMSMappingIncompatible.Create(_FCENAME + ': Binary incompatibility.');
       end;
+    If Header.Version <> SHMS_INTERNAL_VERSION then
+      raise ESHMSMappingIncompatible.CreateFmt(_FCENAME +
+        ': Internal version incompatibility (required %u; got %u)',
+        [UInt32(SHMS_INTERNAL_VERSION),Header.Version]);
   end;
 
-//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --   
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
-  Function TryInitialize: Boolean;
-  var
-    MappingObj: cint;
-    HeaderPtr:  PSharedMemoryHeader;
+  Function HeaderProcess(var Header: TSharedMemoryHeader): Boolean;
+  const
+    _FCENAME = 'TSimpleSharedMemory.Initialize.HeaderProcess';
   begin
     Result := False;
-    // add space for header, ensure alignment on 1024 bits (128 bytes) boundary
+    SimpleRobustMutexLock(Header.HeaderLock);
+    try
+      If optRobustInstance in fCreationOptions then
+        Header.ReferenceCount := RobustCounterAttach;
+      If Header.ReferenceCount = 0 then
+        begin
+        {
+          This seems to be the first time the mapping is accessed - set flags,
+          create section lock (if required) and set reference count to 1.
+        }
+          SectionLockFinalize;        // in case we reopened abandonned mapping
+          HeaderFlagsAndVersionInit(Header);
+          SectionLockInitialize;
+          Header.ReferenceCount := 1;
+          FillChar(fMemory^,fSize,0); // same reason as for SectionLockFinalize
+          Result := True;
+        end
+      else If Header.ReferenceCount > 0 then
+        begin
+        {
+          The mapping and section lock are set up, check flags against creation
+          options and increase reference count.
+
+          Note that the ref count must be always incremented  - if flags check
+          fails with an exception, or the reference count is too high, then
+          destructor is executed and the count is decremented there.
+        }
+          try
+            // protect against overflow
+            If Header.ReferenceCount >= (High(Int32) shr 1{over one billion}) then
+              raise ESHMSInvalidValue.CreateFmt(_FCENAME + ': Reference count too high (%d).',[Header.ReferenceCount]);
+            HeaderFlagsAndVersionCheck(Header);
+            Result := True;
+          finally
+            Inc(Header.ReferenceCount);
+          end;
+        end
+    {
+      Reference count is below 0 - the mapping file was unlinked and section
+      lock destroyed somewhere between shm_open and SimpleRobustMutexLock -
+      drop current mapping and start mapping again from scratch.
+    }
+      else munmap(fMemoryBase,size_t(fFullSize));
+    finally
+      SimpleRobustMutexUnlock(Header.HeaderLock);
+    end;
+  end;
+
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+
+  Function TryInitialize: Boolean;
+  const
+    // to shorten error msgs
+    _FCENAME = 'TSimpleSharedMemory.Initialize.TryInitialize';
+  var
+    MappingObj: cint;
+  begin
+    Result := False;
+    // add space for header (use granularity to keep some of the potential alignment)
     fFullSize := (TMemSize(SizeOf(TSharedMemoryHeader) + 127) and not TMemSize(127)) + fSize;
     // create/open mapping
     MappingObj := shm_open(PChar(StrToSys(fName)),O_CREAT or O_RDWR,S_IRWXU);
     If MappingObj >= 0 then
       try
         If ftruncate(MappingObj,off_t(fFullSize)) < 0 then
-          raise ESHMSMappingTruncateError.CreateFmt('TSimpleSharedMemory.Initialize.TryInitialize: Failed to truncate mapping (%d).',[errno_ptr^]);
+          raise ESHMSMappingTruncateError.CreateFmt(_FCENAME + ': Failed to truncate mapping (%d).',[errno_ptr^]);
         // ensure the header lock sees zeroed memory in case the mapping was just now created
         ReadWriteBarrier;
         // map file into memory
         fMemoryBase := mmap(nil,size_t(fFullSize),PROT_READ or PROT_WRITE,MAP_SHARED,MappingObj,0);
         If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1){MAP_FAILED}) then
           begin
-            HeaderPtr := fMemoryBase;
+            fRobustCounter := -1; // must be set before fMemory is assigned
           {$IFDEF FPCDWM}{$PUSH}W4055{$ENDIF}
             fMemory := Pointer(PtrUInt(fMemoryBase) + PtrUInt(fFullSize - fSize));
           {$IFDEF FPCDWM}{$POP}{$ENDIF}
-            SimpleRobustMutexLock(HeaderPtr^.HeaderLock);
-            try
-              If HeaderPtr^.ReferenceCount = 0 then
-                begin
-                {
-                  This is the first time the mapping is accessed - set flags,
-                  create section lock (if required) and set reference count to 1.
-                }
-                  InitializeHeaderFlags(HeaderPtr);
-                  InitializeSectionLock;
-                  HeaderPtr^.ReferenceCount := 1;
-                  Result := True;
-                end
-              else If HeaderPtr^.ReferenceCount > 0 then
-                begin
-                {
-                  The mapping and section lock are set up, check flags against
-                  creation options and then increase reference count.
-
-                  Note that the ref count must be incremented first - if flags
-                  check fails with an exception, then destructor is executed
-                  and the count is decremented there.
-                }
-                  Inc(HeaderPtr^.ReferenceCount);
-                  CheckHeaderFlags(HeaderPtr);
-                  Result := True;
-                end
-            {
-              The mapping was unlinked and section lock destroyed somewhere
-              between shm_open and SimpleRobustMutexLock - drop current mapping
-              and start mapping again from scratch.
-            }
-              else munmap(fMemoryBase,size_t(fFullSize));
-            finally
-              SimpleRobustMutexUnlock(HeaderPtr^.HeaderLock);
-            end;
+            Result := HeaderProcess(PSharedMemoryHeader(fMemoryBase)^);
           end
-        else raise ESHMSMemoryMappingError.CreateFmt('TSimpleSharedMemory.Initialize.TryInitialize: Failed to map memory (%d).',[errno_ptr^]);
+        else raise ESHMSMemoryMappingError.CreateFmt(_FCENAME + ': Failed to map memory (%d).',[errno_ptr^]);
       finally
         close(MappingObj);
       end
-    else raise ESHMSMappingCreationError.CreateFmt('TSimpleSharedMemory.Initialize.TryInitialize: Failed to create mapping (%d).',[errno_ptr^]);
+    else raise ESHMSMappingCreationError.CreateFmt(_FCENAME + ': Failed to create mapping (%d).',[errno_ptr^]);
   end;
 
 {$ENDIF}
@@ -588,17 +791,17 @@ procedure TSimpleSharedMemory.Initialize(InitSize: TMemSize; const Name: String;
 begin
 fCreationOptions := CreationOptions;
 {$IFNDEF Windows}
-If coRobustInstance in fCreationOptions then
-  Include(fCreationOptions,coRegisterInstance);
+If optRobustInstance in fCreationOptions then
+  Include(fCreationOptions,optRegisterInstance);
 {$ENDIF}
-If coRegisterInstance in fCreationOptions then
+If optRegisterInstance in fCreationOptions then
   RegisterInstance;
 fName := RectifyName(Name);
 If Length(fName) <= 0 then
   raise ESHMSInvalidValue.Create('TSimpleSharedMemory.Initialize: Empty name not allowed.');
 fSize := InitSize;
 {$IFDEF Windows}
-InitializeSectionLock;
+SectionLockInitialize;
 // create/open memory mapping
 fMappingObj := CreateFileMappingW(INVALID_HANDLE_VALUE,nil,PAGE_READWRITE or SEC_COMMIT,
   DWORD(UInt64(fSize) shr 32),DWORD(fSize),PWideChar(StrToWide(fName) + GetMappingSuffix));
@@ -621,21 +824,26 @@ procedure TSimpleSharedMemory.Finalize;
 begin
 UnmapViewOfFile(Memory);
 CloseHandle(fMappingObj);
-FinalizeSectionLock;
+SectionLockFinalize;
 {$ELSE}
-var
-  HeaderPtr:  PSharedMemoryHeader;
-begin
-{
-  If there was exception in the constructor, the header pointer might not be
-  set by this point.
-}
-If Assigned(fMemoryBase) then
+
+  procedure HeaderProcess(var Header: TSharedMemoryHeader);
   begin
-    HeaderPtr := fMemoryBase;
-    SimpleRobustMutexLock(HeaderPtr^.HeaderLock);
+    SimpleRobustMutexLock(Header.HeaderLock);
     try
-      If HeaderPtr^.ReferenceCount = 0 then
+      If optRobustInstance in fCreationOptions then
+        begin
+        {
+          If robust counter was not initialized, it means no code working with
+          header was run in the constructor - therefore there is no point in
+          touching anything here.
+        }
+          If fRobustCounter <> -1 then
+            Header.ReferenceCount := RobustCounterDetach
+          else
+            Exit; // do nothing
+        end;
+      If Header.ReferenceCount = 0 then
         begin
         {
           Zero should be possible only if the initialization failed when
@@ -643,32 +851,82 @@ If Assigned(fMemoryBase) then
           Unlink the mapping but do not destroy section lock as it should not
           exist.
         }
-          HeaderPtr^.ReferenceCount := -1;
+          Header.ReferenceCount := -1;
           shm_unlink(PChar(StrToSys(fName)));
         end
-      else If HeaderPtr^.ReferenceCount = 1 then
+      else If Header.ReferenceCount = 1 then
         begin
         {
           This is the last instance, destroy section lock and unlink the
           mapping.
           Set reference counter to -1 to indicate it is being destroyed.
         }
-          HeaderPtr^.ReferenceCount := -1;
+          Header.ReferenceCount := -1;
           // destroy section lock
-          FinalizeSectionLock;
+          SectionLockFinalize;
           // unlink mapping (ignore errors)
           shm_unlink(PChar(StrToSys(fName)));
         end
-      else If HeaderPtr^.ReferenceCount > 1 then
-        Dec(HeaderPtr^.ReferenceCount);
+      else If Header.ReferenceCount > 1 then
+        Dec(Header.ReferenceCount);
       {
-        Negative value means the mapping is already being destroyed elsewhere,
-        so do nothing.
+        Negative value means the mapping is already being destroyed elsewhere
+        (or robust counter detachment failed), so do nothing.
       }
     finally
-      SimpleRobustMutexUnlock(HeaderPtr^.HeaderLock);
+      SimpleRobustMutexUnlock(Header.HeaderLock);
     end;
   end;
+
+begin
+{
+  Constructor exception rollback
+
+  In case an exception is raised in constructor, pascal automatically runs
+  object's destructor, and since the code executed in TSimpleSharedMemory
+  constructor is rather complex, we must take care what to execute here to
+  do proper rollback.
+  Note that Windows is somewhat fool-proof in this regard, but since Linux is
+  DIY territory, it will go complex fast...
+
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+    If an exception occurs before calling mmap, then both fields fMemory and
+    fMemoryBase are left unassigned (nil) and no rollback or finalizing code
+    is executed here - only the instance cleanup is performed (object is
+    removed from the instance list).
+    Note that, if we have created the file backing this mapping (shm_open,
+    ftruncate), the file is NOT unlinked - simply because we cannot know
+    whether we are the sole user of it by this point.
+    This might be seen as a leak, but there is just no way to know what happens
+    with the file between its creation and execution of cleanup code, so it is
+    safer to make a small leak than to potentially crash other process or
+    damage its data.
+
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+    If mmap fails, then again nothing is done as fMemoryBase will be set to
+    Pointer(-1).
+    This creates no leak, because if mapping fails, then no resources were
+    allocated (no pages mapped) and there is nothing to unmap/free.
+
+    If exception occurs anywhere after the fMemoryBase is assigned a valid
+    value, then the memory is always unmapped (munmap).
+
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+    Right after mapping, the field fMemory is assigned its value - there is
+    very low probability that code executed between mapping and this point
+    could produce an exception, but if it does, then again only the unmapping
+    is performed.
+
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+    Next steps are performed on the header, refer to descriptions in nested
+    function HeaderProcess for more details.
+}
+If Assigned(fMemory) then
+  HeaderProcess(PSharedMemoryHeader(fMemoryBase)^);
 // unmapping is done in any case...
 If Assigned(fMemoryBase) and (fMemoryBase <> Pointer(-1)) then
   munmap(fMemoryBase,size_t(fFullSize));
@@ -795,34 +1053,34 @@ end;
 //------------------------------------------------------------------------------
 {$ENDIF}
 
-procedure TSharedMemory.InitializeSectionLock;
+procedure TSharedMemory.SectionLockInitialize;
 {$IFDEF Windows}
 begin
 // create/open synchronization mutex
 fMappingSync := CreateMutexW(nil,False,PWideChar(StrToWide(fName) + SHMS_NAME_SUFFIX_SYNC));
 If fMappingSync = 0 then
-  raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to create mutex (%d).',[GetLastError]);
+  raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.SectionLockInitialize: Failed to create mutex (%d).',[GetLastError]);
 end;
 {$ELSE}
 var
   MutexAttr:  pthread_mutexattr_t;
 begin
-If not (coCrossArchitecture in fCreationOptions) then
+If not (optCrossArchitecture in fCreationOptions) then
   begin
     If ErrChk(pthread_mutexattr_init(@MutexAttr)) then
       try
         If not ErrChk(pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED)) then
-          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to set mutex attribute pshared (%d).',[ThrErrorCode]);
+          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.SectionLockInitialize: Failed to set mutex attribute pshared (%d).',[ThrErrorCode]);
         If not ErrChk(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
-          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to set mutex attribute type (%d).',[ThrErrorCode]);
+          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.SectionLockInitialize: Failed to set mutex attribute type (%d).',[ThrErrorCode]);
         If not ErrChk(pthread_mutexattr_setrobust(@MutexAttr,PTHREAD_MUTEX_ROBUST)) then
-          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to set mutex attribute robust (%d).',[ThrErrorCode]);
+          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.SectionLockInitialize: Failed to set mutex attribute robust (%d).',[ThrErrorCode]);
         If not ErrChk(pthread_mutex_init(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex),@MutexAttr)) then
-          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to init mutex (%d).',[ThrErrorCode]);
+          raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.SectionLockInitialize: Failed to init mutex (%d).',[ThrErrorCode]);
       finally
         pthread_mutexattr_destroy(@MutexAttr);
       end
-    else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.InitializeSectionLock: Failed to init mutex attributes (%d).',[ThrErrorCode]);
+    else raise ESHMSMutexCreationError.CreateFmt('TSharedMemory.SectionLockInitialize: Failed to init mutex attributes (%d).',[ThrErrorCode]);
   end
 else SimpleRecursiveMutexInit(PSharedMemoryHeader(fMemoryBase)^.SectionLock.SimpleMutex);
 end;
@@ -830,12 +1088,12 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSharedMemory.FinalizeSectionLock;
+procedure TSharedMemory.SectionLockFinalize;
 begin
 {$IFDEF Windows}
 CloseHandle(fMappingSync);
 {$ELSE}
-If not (coCrossArchitecture in fCreationOptions) then
+If not (optCrossArchitecture in fCreationOptions) then
   pthread_mutex_destroy(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex)) // ignore errors
 else
   SimpleRecursiveMutexInit(PSharedMemoryHeader(fMemoryBase)^.SectionLock.SimpleMutex);    // using init here is not an error
@@ -856,7 +1114,7 @@ end;
 var
   ReturnValue:  cint;
 begin
-If not (coCrossArchitecture in fCreationOptions) then
+If not (optCrossArchitecture in fCreationOptions) then
   begin
     ReturnValue := pthread_mutex_lock(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex));
     If ReturnValue = ESysEOWNERDEAD then
@@ -883,7 +1141,7 @@ begin
 If not ReleaseMutex(fMappingSync) then
   raise ESHMSUnlockError.CreateFmt('TSharedMemory.Unlock: Failed to unlock (%d).',[GetLastError]);
 {$ELSE}
-If not (coCrossArchitecture in fCreationOptions) then
+If not (optCrossArchitecture in fCreationOptions) then
   begin
     If not ErrChk(pthread_mutex_unlock(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex))) then
       raise ESHMSUnlockError.CreateFmt('TSharedMemory.Unlock: Failed to unlock (%d).',[ThrErrorCode]);
