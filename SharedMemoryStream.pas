@@ -33,9 +33,9 @@
     In non-simple streams, the methods Read and Write are protected by a lock,
     so it is not necessary to lock the access explicitly.
 
-  Version 1.3 (2025-02-14)
+  Version 1.3.1 (2025-03-05)
 
-  Last change 2025-02-14
+  Last change 2025-03-05
 
   ©2018-2025 František Milt
 
@@ -140,8 +140,9 @@ type
   ESHMSKeyGenerationError   = class(ESHMSException);
   ESHMSSemaphoreError       = class(ESHMSException);
 
-  ESHMSLockError   = class(ESHMSException);
-  ESHMSUnlockError = class(ESHMSException);
+  ESHMSLockError        = class(ESHMSException);
+  ESHMSUnlockError      = class(ESHMSException);
+  ESHMSConsistencyError = class(ESHMSException);
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -211,7 +212,18 @@ type
     procedure SectionLockInitialize; override;
     procedure SectionLockFinalize; override;
   public
-    procedure Lock; virtual;
+  {
+    Lock
+
+    If Lock returns true, it means the underlying mutex was succesfully
+    acquired with no problems.
+    But when false is returned, it means the mutex is acquired but was
+    abandoned - meaning its previous owner died without releasing it.
+    This can mean the protected data might be in an inconsistent state.
+    You should check the data consistency and if correction is not possible,
+    fail in some sensible way.
+  }
+    Function Lock: Boolean; virtual;
     procedure Unlock; virtual;
   end;
 
@@ -229,6 +241,7 @@ type
     fSharedMemory:  TSimpleSharedMemory;
     Function GetName: String; virtual;
     class Function GetSharedMemoryInstance(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions): TSimpleSharedMemory; virtual;
+    procedure Initialize; virtual;
   public
     constructor Create(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions = SHMS_CREATOPTS_DEFAULT);
     destructor Destroy; override;
@@ -248,12 +261,38 @@ type
 type
   TSharedMemoryStream = class(TSimpleSharedMemoryStream)
   protected
+    fFailOnAbandonedLock: Boolean;
     class Function GetSharedMemoryInstance(InitSize: TMemSize; const Name: String; CreationOptions: TCreationOptions): TSimpleSharedMemory; override;
+    procedure Initialize; override;
   public
-    procedure Lock; virtual;
+  {
+    Lock
+
+    See TSharedMemory.Lock method.
+  }
+    Function Lock: Boolean; virtual;
     procedure Unlock; virtual;
     Function Read(var Buffer; Count: LongInt): LongInt; override;
     Function Write(const Buffer; Count: LongInt): LongInt; override;
+  {
+    ReadNoLock
+    WriteNoLock
+
+    These two functions are non-locking variants of Read and Write (which
+    are both serialized). They are here for situations where locking of each
+    operation is not needed or desired.
+  }
+    Function ReadNoLock(var Buffer; Count: LongInt): LongInt; virtual;
+    Function WriteNoLock(const Buffer; Count: LongInt): LongInt; virtual;
+  {
+    FailOnAbandonedLock
+
+    If this property is set to True, then methods Read and Write will fail with
+    an ESHMSConsistencyError exception when lock protecting the data indicates
+    that it was abandoned (its previous owner died without unlocking it).
+    Otherwise abandonment is ignored.
+  }
+    property FailOnAbandonedLock: Boolean read fFailOnAbandonedLock write fFailOnAbandonedLock;
   end;
 
 implementation
@@ -264,9 +303,9 @@ uses
   {$IFNDEF Windows}InterlockedOps,{$ENDIF} StrRect;
 
 {$IFDEF Linux}
-  {$LINKLIB libc}
-  {$LINKLIB librt}
-  {$LINKLIB pthread}
+  {$LINKLIB C}
+  {$LINKLIB RT}
+  {$LINKLIB PTHREAD}
 {$ENDIF}
 
 {$IFDEF FPC_DisableWarns}
@@ -701,52 +740,53 @@ procedure TSimpleSharedMemory.Initialize(InitSize: TMemSize; const Name: String;
     _FCENAME = 'TSimpleSharedMemory.Initialize.HeaderProcess';
   begin
     Result := False;
-    SimpleRobustMutexLock(Header.HeaderLock);
-    try
-      If optRobustInstance in fCreationOptions then
-        Header.ReferenceCount := RobustCounterAttach;
-      If Header.ReferenceCount = 0 then
-        begin
-        {
-          This seems to be the first time the mapping is accessed - set flags,
-          create section lock (if required) and set reference count to 1.
-        }
-          SectionLockFinalize;        // in case we reopened abandonned mapping
-          HeaderFlagsAndVersionInit(Header);
-          SectionLockInitialize;
-          Header.ReferenceCount := 1;
-          FillChar(fMemory^,fSize,0); // same reason as for SectionLockFinalize
-          Result := True;
-        end
-      else If Header.ReferenceCount > 0 then
-        begin
-        {
-          The mapping and section lock are set up, check flags against creation
-          options and increase reference count.
-
-          Note that the ref count must be always incremented  - if flags check
-          fails with an exception, or the reference count is too high, then
-          destructor is executed and the count is decremented there.
-        }
-          try
-            // protect against overflow
-            If Header.ReferenceCount >= (High(Int32) shr 1{over one billion}) then
-              raise ESHMSInvalidValue.CreateFmt(_FCENAME + ': Reference count too high (%d).',[Header.ReferenceCount]);
-            HeaderFlagsAndVersionCheck(Header);
+    If SimpleRobustMutexLock(Header.HeaderLock) = lrSignaled then
+      try
+        If optRobustInstance in fCreationOptions then
+          Header.ReferenceCount := RobustCounterAttach;
+        If Header.ReferenceCount = 0 then
+          begin
+          {
+            This seems to be the first time the mapping is accessed - set flags,
+            create section lock (if required) and set reference count to 1.
+          }
+            SectionLockFinalize;        // in case we reopened abandonned mapping
+            HeaderFlagsAndVersionInit(Header);
+            SectionLockInitialize;
+            Header.ReferenceCount := 1;
+            FillChar(fMemory^,fSize,0); // same reason as for SectionLockFinalize
             Result := True;
-          finally
-            Inc(Header.ReferenceCount);
-          end;
-        end
-    {
-      Reference count is below 0 - the mapping file was unlinked and section
-      lock destroyed somewhere between shm_open and SimpleRobustMutexLock -
-      drop current mapping and start mapping again from scratch.
-    }
-      else munmap(fMemoryBase,size_t(fFullSize));
-    finally
-      SimpleRobustMutexUnlock(Header.HeaderLock);
-    end;
+          end
+        else If Header.ReferenceCount > 0 then
+          begin
+          {
+            The mapping and section lock are set up, check flags against
+            creation options and increase reference count.
+
+            Note that the ref count must be always incremented  - if flags
+            check fails with an exception, or the reference count is too high,
+            then destructor is executed and the count is decremented there.
+          }
+            try
+              // protect against overflow
+              If Header.ReferenceCount >= (High(Int32) shr 1{over one billion}) then
+                raise ESHMSInvalidValue.CreateFmt(_FCENAME + ': Reference count too high (%d).',[Header.ReferenceCount]);
+              HeaderFlagsAndVersionCheck(Header);
+              Result := True;
+            finally
+              Inc(Header.ReferenceCount);
+            end;
+          end
+      {
+        Reference count is below 0 - the mapping file was unlinked and section
+        lock destroyed somewhere between shm_open and SimpleRobustMutexLock -
+        drop current mapping and start mapping again from scratch.
+      }
+        else munmap(fMemoryBase,size_t(fFullSize));
+      finally
+        SimpleRobustMutexUnlock(Header.HeaderLock);
+      end
+    else raise ESHMSConsistencyError.Create(_FCENAME + ': Lock was abandoned, internal data might be damaged.');
   end;
 
 //--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
@@ -828,54 +868,57 @@ SectionLockFinalize;
 {$ELSE}
 
   procedure HeaderProcess(var Header: TSharedMemoryHeader);
+  const
+    _FCENAME = 'TSimpleSharedMemory.Finalize.HeaderProcess';
   begin
-    SimpleRobustMutexLock(Header.HeaderLock);
-    try
-      If optRobustInstance in fCreationOptions then
-        begin
+    If SimpleRobustMutexLock(Header.HeaderLock) = lrSignaled then
+      try
+        If optRobustInstance in fCreationOptions then
+          begin
+          {
+            If robust counter was not initialized, it means no code working
+            with header was run in the constructor - therefore there is no
+            point in touching anything here.
+          }
+            If fRobustCounter <> -1 then
+              Header.ReferenceCount := RobustCounterDetach
+            else
+              Exit; // do nothing
+          end;
+        If Header.ReferenceCount = 0 then
+          begin
+          {
+            Zero should be possible only if the initialization failed when
+            creating the section lock.
+            Unlink the mapping but do not destroy section lock as it should not
+            exist.
+          }
+            Header.ReferenceCount := -1;
+            shm_unlink(PChar(StrToSys(fName)));
+          end
+        else If Header.ReferenceCount = 1 then
+          begin
+          {
+            This is the last instance, destroy section lock and unlink the
+            mapping.
+            Set reference counter to -1 to indicate it is being destroyed.
+          }
+            Header.ReferenceCount := -1;
+            // destroy section lock
+            SectionLockFinalize;
+            // unlink mapping (ignore errors)
+            shm_unlink(PChar(StrToSys(fName)));
+          end
+        else If Header.ReferenceCount > 1 then
+          Dec(Header.ReferenceCount);
         {
-          If robust counter was not initialized, it means no code working with
-          header was run in the constructor - therefore there is no point in
-          touching anything here.
+          Negative value means the mapping is already being destroyed elsewhere
+          (or robust counter detachment failed), so do nothing.
         }
-          If fRobustCounter <> -1 then
-            Header.ReferenceCount := RobustCounterDetach
-          else
-            Exit; // do nothing
-        end;
-      If Header.ReferenceCount = 0 then
-        begin
-        {
-          Zero should be possible only if the initialization failed when
-          creating the section lock.
-          Unlink the mapping but do not destroy section lock as it should not
-          exist.
-        }
-          Header.ReferenceCount := -1;
-          shm_unlink(PChar(StrToSys(fName)));
-        end
-      else If Header.ReferenceCount = 1 then
-        begin
-        {
-          This is the last instance, destroy section lock and unlink the
-          mapping.
-          Set reference counter to -1 to indicate it is being destroyed.
-        }
-          Header.ReferenceCount := -1;
-          // destroy section lock
-          SectionLockFinalize;
-          // unlink mapping (ignore errors)
-          shm_unlink(PChar(StrToSys(fName)));
-        end
-      else If Header.ReferenceCount > 1 then
-        Dec(Header.ReferenceCount);
-      {
-        Negative value means the mapping is already being destroyed elsewhere
-        (or robust counter detachment failed), so do nothing.
-      }
-    finally
-      SimpleRobustMutexUnlock(Header.HeaderLock);
-    end;
+      finally
+        SimpleRobustMutexUnlock(Header.HeaderLock);
+      end
+    else raise ESHMSConsistencyError.Create(_FCENAME + ': Lock was abandoned, internal data might be damaged.');;
   end;
 
 begin
@@ -1104,11 +1147,15 @@ end;
     TSharedMemory - public methods
 -------------------------------------------------------------------------------}
 
-procedure TSharedMemory.Lock;
+Function TSharedMemory.Lock: Boolean;
 {$IFDEF Windows}
 begin
-If not(WaitForSingleObject(fMappingSync,INFINITE) in [WAIT_ABANDONED,WAIT_OBJECT_0]) then
+case WaitForSingleObject(fMappingSync,INFINITE) of
+  WAIT_OBJECT_0:  Result := True;
+  WAIT_ABANDONED: Result := False;
+else
   raise ESHMSLockError.Create('TSharedMemory.Lock: Failed to lock.');
+end;
 end;
 {$ELSE}
 var
@@ -1117,8 +1164,10 @@ begin
 If not (optCrossArchitecture in fCreationOptions) then
   begin
     ReturnValue := pthread_mutex_lock(Addr(PSharedMemoryHeader(fMemoryBase)^.SectionLock.PthreadMutex));
+    Result := True;
     If ReturnValue = ESysEOWNERDEAD then
       begin
+        Result := False;
       {
         Owner of the mutex died, it is now owned by the calling thread, but
         must be made consistent to use it again.
@@ -1129,7 +1178,7 @@ If not (optCrossArchitecture in fCreationOptions) then
     else If not ErrChk(ReturnValue) then
       raise ESHMSLockError.CreateFmt('TSharedMemory.Lock: Failed to lock (%d).',[ThrErrorCode]);
   end
-else SimpleRecursiveMutexLock(PSharedMemoryHeader(fMemoryBase)^.SectionLock.SimpleMutex);
+else Result := SimpleRecursiveMutexLock(PSharedMemoryHeader(fMemoryBase)^.SectionLock.SimpleMutex) in [lrSignaled,lrRelock];
 end;
 {$ENDIF}
 
@@ -1174,6 +1223,13 @@ begin
 Result := TSimpleSharedMemory.Create(InitSize,Name,CreationOptions);
 end;
 
+//------------------------------------------------------------------------------
+
+procedure TSimpleSharedMemoryStream.Initialize;
+begin
+// nothing to do here
+end;
+
 {-------------------------------------------------------------------------------
     TSharedMemoryStream - public methods
 -------------------------------------------------------------------------------}
@@ -1191,6 +1247,7 @@ except
   raise;
 end;
 fSharedMemory := SharedMemory;
+Initialize;
 end;
 
 //------------------------------------------------------------------------------
@@ -1234,13 +1291,20 @@ begin
 Result := TSharedMemory.Create(InitSize,Name,CreationOptions);
 end;
 
+//------------------------------------------------------------------------------
+
+procedure TSharedMemoryStream.Initialize;
+begin
+fFailOnAbandonedLock := False;
+end;
+
 {-------------------------------------------------------------------------------
     TSharedMemoryStream - public methods
 -------------------------------------------------------------------------------}
 
-procedure TSharedMemoryStream.Lock;
+Function TSharedMemoryStream.Lock: Boolean;
 begin
-TSharedMemory(fSharedMemory).Lock;
+Result := TSharedMemory(fSharedMemory).Lock;
 end;
 
 //------------------------------------------------------------------------------
@@ -1254,26 +1318,41 @@ end;
 
 Function TSharedMemoryStream.Read(var Buffer; Count: LongInt): LongInt;
 begin
-Lock;
-try
-  Result := inherited Read(Buffer,Count);
-finally
-  Unlock;
-end;
+If Lock or not fFailOnAbandonedLock then
+  try
+    Result := inherited Read(Buffer,Count);
+  finally
+    Unlock;
+  end
+else raise ESHMSConsistencyError.Create('TSharedMemoryStream.Read: Lock was abandoned, protected data might be damaged.');
 end;
 
 //------------------------------------------------------------------------------
 
 Function TSharedMemoryStream.Write(const Buffer; Count: LongInt): LongInt;
 begin
-Lock;
-try
-  Result := inherited Write(Buffer,Count);
-finally
-  Unlock;
-end;
+If Lock or not fFailOnAbandonedLock then
+  try
+    Result := inherited Write(Buffer,Count);
+  finally
+    Unlock;
+  end
+else raise ESHMSConsistencyError.Create('TSharedMemoryStream.Write: Lock was abandoned, protected data might be damaged.');
 end;
 
+//------------------------------------------------------------------------------
+
+Function TSharedMemoryStream.ReadNoLock(var Buffer; Count: LongInt): LongInt;
+begin
+Result := inherited Read(Buffer,Count);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSharedMemoryStream.WriteNoLock(const Buffer; Count: LongInt): LongInt;
+begin
+Result := inherited Write(Buffer,Count);
+end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
